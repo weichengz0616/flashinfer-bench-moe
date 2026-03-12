@@ -18,49 +18,44 @@ from typing import List, Sequence
 @triton.jit
 def gemm1_kernel(
     # input
-    group_a_ptrs, # [group_size], fp8 -> [s_i, 7168]
-    a_scale_ptrs, # [group_size], fp32 -> [7168 // 128, s_i]
-    group_b_ptrs, # [group_size], fp8 -> [4096, 7168]
-    b_scale_ptrs, # [group_size], fp32 -> [4096 // 128, 7168 // 128]
-    group_gemm_sizes, # [group_size, 3], <m, n, k>, n=4096, k=7168
-    g_lds, # [group_size, 3], <lda, ldb, ldc>
-    group_size, # num of gemms = num of local experts, <= 32
+    a_base_ptr, # [sum(s_i), 7168], fp8
+    a_scale_base_ptr, # [7168//128, sum(s_i)], fp32
+    a_offset_ptr, # [33], int32
+    b_base_ptr, # [32, 4096, 7168], fp8
+    b_scale_base_ptr, # [32, 4096//128, 7168//128], fp32
     # output
-    group_c_ptrs, # [group_size], fp8 -> [s_i, 2048]
-    # c_scale_ptrs, # [group_size], fp32 -> [2048 // 128, s_i]
+    c_base_ptr, # [sum(s_i), 2048], fp32
     # other
     NUM_SM: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    dtype = tl.float8e4nv
-    # dtype = tl.float32
     tile_idx = tl.program_id(0)
     last_gemm_end_tile_idx = 0
 
+    num_valid_tokens = tl.load(a_offset_ptr + 32) # sum(s_i)
     # 遍历 gemm
-    for g in range(group_size):
-        # get the gemm size of the current problem
-        gm = tl.load(group_gemm_sizes + g * 3)
-        gn = tl.load(group_gemm_sizes + g * 3 + 1) # 4096
-        gk = tl.load(group_gemm_sizes + g * 3 + 2) # 7168
+    for i in range(32):
+        gm = tl.load(a_offset_ptr + i + 1) - tl.load(a_offset_ptr + i) # s_i
+        gn = 4096
+        gk = 7168
         num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
         num_n_tiles = tl.cdiv(gn // 2, BLOCK_SIZE_N) # 处理两个 tile
-        num_tiles = num_m_tiles * num_n_tiles
+        num_tiles = (num_m_tiles * num_n_tiles).to(tl.int32)
 
         # 检查当前 tile 编号是否还在当前 gemm 范围内
         if tile_idx >= last_gemm_end_tile_idx and tile_idx < last_gemm_end_tile_idx + num_tiles:
-            lda = tl.load(g_lds + g * 3)
-            ldb = tl.load(g_lds + g * 3 + 1)
-            ldc = tl.load(g_lds + g * 3 + 2)
+            lda = 7168
+            ldb = 7168
+            ldc = 2048
 
-            a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(dtype))
-            b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(dtype))
-            c_ptr = tl.load(group_c_ptrs + g).to(tl.pointer_type(tl.float32))
+            a_ptr = a_base_ptr + tl.load(a_offset_ptr + i) * lda
+            b_ptr = b_base_ptr + gn * gk * i
+            c_ptr = c_base_ptr + tl.load(a_offset_ptr + i) * ldc
 
-            a_scale_ptr = tl.load(a_scale_ptrs + g).to(tl.pointer_type(tl.float32))
-            b_scale_ptr = tl.load(b_scale_ptrs + g).to(tl.pointer_type(tl.float32))
+            a_scale_ptr = a_scale_base_ptr + tl.load(a_offset_ptr + i)
+            b_scale_ptr = b_scale_base_ptr + gn // 128 * gk // 128 * i
             # c_scale_ptr = tl.load(c_scale_ptrs + g).to(tl.pointer_type(tl.float32))
 
             # TMA
@@ -117,9 +112,7 @@ def gemm1_kernel(
                     )
                     
                     # 获取当前 128x128 block 的缩放因子
-                    # row_idx * cols + col_idx
-                    # a_scale = tl.load(a_scale_ptr + (offs_am // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
-                    a_scale_idx = a_scale_ptr + offs_am + kk * gm + tl.arange(0, BLOCK_SIZE_M)
+                    a_scale_idx = a_scale_ptr + offs_am + kk * num_valid_tokens + tl.arange(0, BLOCK_SIZE_M)
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
                     a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
                     b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
@@ -168,82 +161,34 @@ def gemm1_kernel(
         # 进入下一个 gemm
         last_gemm_end_tile_idx = last_gemm_end_tile_idx + num_tiles
 
-def _to_ptr_tensor(tensors: Sequence[torch.Tensor], device: torch.device) -> torch.Tensor:
-    ptrs = [t.data_ptr() for t in tensors]
-    return torch.tensor(ptrs, device="cpu", dtype=torch.int64, pin_memory=True).to(device, non_blocking=True)
-
 def launch_gemm1_kernel(
-    a_list: Sequence[torch.Tensor],
-    a_scale_list: Sequence[torch.Tensor],
-    b_list: Sequence[torch.Tensor],
-    b_scale_list: Sequence[torch.Tensor],
-    out_list: Sequence[torch.Tensor],
+    permute_hidden_states: torch.tensor, # [sum(s), 7168], fp8
+    permute_hidden_states_scale: torch.tensor, # [7168//128, sum(s)], fp32
+    offset: torch.tensor, # [33], int32, 每个 expert 处理的行数的前缀和，最后一个元素是 sum(s)
+    gemm1_weights: torch.tensor, # [32, 4096, 7168], fp8
+    gemm1_weights_scale: torch.tensor, # [32, 4096//128, 7168//128], fp32
+    output: torch.tensor, # [sum(s), 2048], fp32
     # out_scale_list: Sequence[torch.Tensor],
     *,
     block_size_m: int = 32,
     block_size_n: int = 128,
     block_size_k: int = 128,
 ) -> List[torch.Tensor]:
-    """Launch grouped_matmul_tma_kernel with torch tensors.
-
-    Args:
-        a_list: list of A_i with shape [M_i, K_i], fp8.
-        a_scale_list: list of per-block scales for A_i, float32.
-        b_list: list of B_i with shape [N_i, K_i], fp8.
-        b_scale_list: list of per-block scales for B_i, float32.
-
-    Returns:
-        List of C_i tensors, each with shape [M_i, N_i], bfloat16.
-    """
-    # _validate_group_inputs(a_list, a_scale_list, b_list, b_scale_list)
-    # if block_size_k % 128 != 0:
-    #     raise ValueError("block_size_k must be a multiple of 128 for current scale indexing")
-
-    group_size = len(a_list)
-    device = a_list[0].device
-
-    # Keep row-major contiguous layout to match [stride, 1] descriptors.
-    a_list = [a.contiguous() for a in a_list]
-    b_list = [b.contiguous() for b in b_list]
-
-    group_gemm_sizes = torch.empty((group_size, 3), device="cpu", dtype=torch.int32)
-    g_lds = torch.empty((group_size, 3), device="cpu", dtype=torch.int32)
-
-    for i, (a, b, c) in enumerate(zip(a_list, b_list, out_list)):
-        m, k = a.shape
-        n = b.shape[0]
-        group_gemm_sizes[i, 0] = m
-        group_gemm_sizes[i, 1] = n
-        group_gemm_sizes[i, 2] = k
-        g_lds[i, 0] = a.stride(0)
-        g_lds[i, 1] = b.stride(0)
-        g_lds[i, 2] = c.stride(0)
-
-    group_gemm_sizes = group_gemm_sizes.to(device)
-    g_lds = g_lds.to(device)
-
-    group_a_ptrs = _to_ptr_tensor(a_list, device)
-    group_b_ptrs = _to_ptr_tensor(b_list, device)
-    group_c_ptrs = _to_ptr_tensor(out_list, device)
-    a_scale_ptrs = _to_ptr_tensor(a_scale_list, device)
-    b_scale_ptrs = _to_ptr_tensor(b_scale_list, device)
-    # c_scale_ptrs = _to_ptr_tensor(out_scale_list, device)
-    torch.cuda.synchronize(device)
+    # group_size = len(a_list)
+    device = permute_hidden_states.device
 
     num_sm = torch.cuda.get_device_properties(device).multi_processor_count
     grid = (num_sm,)
 
     gemm1_kernel[grid](
         # input
-        group_a_ptrs,
-        a_scale_ptrs,
-        group_b_ptrs,
-        b_scale_ptrs,
-        group_gemm_sizes,
-        g_lds,
-        group_size,
+        a_base_ptr=permute_hidden_states,
+        a_scale_base_ptr=permute_hidden_states_scale,
+        a_offset_ptr=offset,
+        b_base_ptr=gemm1_weights,
+        b_scale_base_ptr=gemm1_weights_scale,
         # output
-        group_c_ptrs,
+        c_base_ptr=output,
         # c_scale_ptrs,
         NUM_SM=num_sm,
         BLOCK_SIZE_M=block_size_m,
@@ -253,37 +198,35 @@ def launch_gemm1_kernel(
     )
     return
 
+
 # input:
 # [sum(s), 7168]
 # -> 共 32 个 expert，sum(s) 可以分成 32 部分，每个部分的长度，以及每个部分的 seq id，即每个 expert 实际上是处理的哪些行
 def gemm1(
-    permute_hidden_states_list: torch.Tensor, # [sum(s), 7168], fp8
-    hidden_states_scale_list: torch.Tensor, # [7168//128, seq_len]
-    gemm1_weights_list: torch.Tensor, # [32, 4096, 7168], fp8
-    gemm1_weights_scale_list: torch.Tensor, # [32, 4096//128, 7168//128], fp32
-): # return [sum(s), 4096]
+    permute_hidden_states,
+    permute_hidden_states_scale,
+    offset,
+    gemm1_weights,
+    gemm1_weights_scale,
+): # return [sum(s), 2048]
     
-    out_list = []
-    out_scale_list = []
-
-    for i in range(len(permute_hidden_states_list)):
-        s_i = permute_hidden_states_list[i].shape[0]
-        out_list.append(torch.empty((s_i, 2048), device=permute_hidden_states_list[i].device, dtype=torch.float32))
-        # out_scale_list.append(torch.empty((2048 // 128, s_i), device=permute_hidden_states_list[i].device, dtype=torch.float32))
+    output = torch.empty((permute_hidden_states.shape[0], 2048), device=permute_hidden_states.device, dtype=torch.float32)
 
     launch_gemm1_kernel(
-        permute_hidden_states_list,
-        hidden_states_scale_list,
-        gemm1_weights_list,
-        gemm1_weights_scale_list,
-        out_list,
+        permute_hidden_states,
+        permute_hidden_states_scale,
+        offset,
+        gemm1_weights,
+        gemm1_weights_scale,
+        output,
         # out_scale_list,
         block_size_m=32,
         block_size_n=128,
         block_size_k=128,
     )
 
-    return out_list, out_scale_list
+    return output
+
 
 #################################################################################
 #################################################################################
@@ -299,15 +242,12 @@ def gemm1(
 @triton.jit
 def gemm2_kernel(
     # input
-    group_a_ptrs, # [group_size], fp8 -> [s_i, 2048]
-    # a_scale_ptrs, # [group_size], fp32 -> [2048 // 128, s_i]
-    group_b_ptrs, # [group_size], fp8 -> [7168, 2048]
-    b_scale_ptrs, # [group_size], fp32 -> [7168 // 128, 2048 // 128]
-    group_gemm_sizes, # [group_size, 3], <m, n, k> n=7168,k=2048
-    g_lds, # [group_size, 3], <lda, ldb, ldc>
-    group_size, # num of gemms = num of local experts, 32
-    permute_weights_ptrs, # [group_size], fp32 -> [s_i]
-    permute_token_idx_ptrs, # [group_size], int32 -> [s_i]
+    a_base_ptr,
+    a_offset_ptr,
+    b_base_ptr,
+    b_scale_base_ptr,
+    permute_weights_base_ptr, # [group_size], fp32 -> [s_i]
+    permute_token_idx_base_ptr, # [group_size], int32 -> [s_i]
     #output
     output_ptr, # [seq_len, 7168], bf16
     # other
@@ -320,30 +260,30 @@ def gemm2_kernel(
     last_gemm_end_tile_idx = 0
 
     # 遍历 gemm
-    for g in range(group_size):
+    for i in range(32):
         # get the gemm size of the current problem
-        gm = tl.load(group_gemm_sizes + g * 3)
-        gn = tl.load(group_gemm_sizes + g * 3 + 1) # 4096
-        gk = tl.load(group_gemm_sizes + g * 3 + 2) # 7168
+        gm = tl.load(a_offset_ptr + i + 1) - tl.load(a_offset_ptr + i)
+        gn = 7168
+        gk = 2048
         num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
         num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
         num_tiles = num_m_tiles * num_n_tiles
 
         # 检查当前 tile 编号是否还在当前 gemm 范围内
         if tile_idx >= last_gemm_end_tile_idx and tile_idx < last_gemm_end_tile_idx + num_tiles:
-            lda = tl.load(g_lds + g * 3)
-            ldb = tl.load(g_lds + g * 3 + 1)
+            lda = 2048
+            ldb = 2048
 
-            a_ptr = tl.load(group_a_ptrs + g).to(tl.pointer_type(tl.float32))
-            b_ptr = tl.load(group_b_ptrs + g).to(tl.pointer_type(tl.float8e4nv))
+            a_ptr = a_base_ptr + tl.load(a_offset_ptr + i) * lda
+            b_ptr = b_base_ptr + gn * gk * i
             
             # a_scale_ptr = tl.load(a_scale_ptrs + g).to(tl.pointer_type(tl.float32))
-            b_scale_ptr = tl.load(b_scale_ptrs + g).to(tl.pointer_type(tl.float32))
+            b_scale_ptr = b_scale_base_ptr + gn // 128 * gk // 128 * i
 
             # 当前 expert 处理的 tokens 对应的 weight，长度为 gm
-            p_weight_ptr = tl.load(permute_weights_ptrs + g).to(tl.pointer_type(tl.float32))
+            p_weight_ptr = permute_weights_base_ptr + tl.load(a_offset_ptr + i)
             # 当前 expert 处理的 tokens 对应的 token idx，长度为 gm，决定写回 output 的位置
-            p_source_idx_ptr = tl.load(permute_token_idx_ptrs + g).to(tl.pointer_type(tl.int32))
+            p_source_idx_ptr = permute_token_idx_base_ptr + tl.load(a_offset_ptr + i)
 
             # TMA
             a_desc = tl.make_tensor_descriptor(
@@ -369,6 +309,7 @@ def gemm2_kernel(
                 offs_am = tile_m_idx * BLOCK_SIZE_M
                 offs_bn1 = tile_n_idx * BLOCK_SIZE_N
 
+                # 缩放矩阵每一行的元素个数
                 num_k_blocks = tl.cdiv(k, 128)
                 acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
@@ -417,80 +358,35 @@ def gemm2_kernel(
         # 进入下一个 gemm
         last_gemm_end_tile_idx = last_gemm_end_tile_idx + num_tiles
 
+
 def launch_gemm2_kernel(
-    a_list: Sequence[torch.Tensor],
-    # a_scale_list: Sequence[torch.Tensor],
-    b_list: Sequence[torch.Tensor],
-    b_scale_list: Sequence[torch.Tensor],
-    permute_weights_list: Sequence[torch.Tensor],
-    permute_token_idx_list: Sequence[torch.Tensor],
+    gemm1_output,
+    offset,
+    gemm2_weights,
+    gemm2_weights_scale,
+    permute_weights,
+    permute_token_idx,
     output: torch.Tensor,
     *,
     block_size_m: int = 32,
     block_size_n: int = 128,
     block_size_k: int = 128,
 ) -> torch.Tensor:
-    # _validate_gemm2_inputs(
-    #     a_list,
-    #     a_scale_list,
-    #     b_list,
-    #     b_scale_list,
-    #     permute_weights_list,
-    #     permute_token_idx_list,
-    #     output,
-    # )
     if block_size_k % 128 != 0:
         raise ValueError("block_size_k must be a multiple of 128 for current scale indexing")
 
-    group_size = len(a_list)
-    device = a_list[0].device
-
-    # Keep row-major contiguous layout to match [stride, 1] descriptors.
-    a_list = [a.contiguous() for a in a_list]
-    b_list = [b.contiguous() for b in b_list]
-    # a_scale_list = [a_s.contiguous() for a_s in a_scale_list]
-    b_scale_list = [b_s.contiguous() for b_s in b_scale_list]
-    permute_weights_list = [w.contiguous() for w in permute_weights_list]
-    permute_token_idx_list = [idx.contiguous() for idx in permute_token_idx_list]
-    output = output.contiguous()
-
-    group_gemm_sizes = torch.empty((group_size, 3), device="cpu", dtype=torch.int32)
-    g_lds = torch.empty((group_size, 3), device="cpu", dtype=torch.int32)
-
-    for i, (a, b) in enumerate(zip(a_list, b_list)):
-        m, k = a.shape
-        n = b.shape[0]
-        group_gemm_sizes[i, 0] = m
-        group_gemm_sizes[i, 1] = n
-        group_gemm_sizes[i, 2] = k
-        g_lds[i, 0] = a.stride(0)
-        g_lds[i, 1] = b.stride(0)
-        g_lds[i, 2] = output.stride(0)
-
-    group_gemm_sizes = group_gemm_sizes.to(device)
-    g_lds = g_lds.to(device)
-
-    group_a_ptrs = _to_ptr_tensor(a_list, device)
-    # a_scale_ptrs = _to_ptr_tensor(a_scale_list, device)
-    group_b_ptrs = _to_ptr_tensor(b_list, device)
-    b_scale_ptrs = _to_ptr_tensor(b_scale_list, device)
-    permute_weights_ptrs = _to_ptr_tensor(permute_weights_list, device)
-    permute_token_idx_ptrs = _to_ptr_tensor(permute_token_idx_list, device)
-    torch.cuda.synchronize(device)
+    device = output.device
 
     num_sm = torch.cuda.get_device_properties(device).multi_processor_count
     grid = (num_sm,)
 
     gemm2_kernel[grid](
-        group_a_ptrs,
-        # a_scale_ptrs,
-        group_b_ptrs,
-        b_scale_ptrs,
-        group_gemm_sizes,
-        g_lds,
-        group_size,
-        permute_weights_ptrs,
-        permute_token_idx_ptrs,
+        gemm1_output,
+        offset,
+        gemm2_weights,
+        gemm2_weights_scale,
+        permute_weights,
+        permute_token_idx,
         output,
         NUM_SM=num_sm,
         BLOCK_SIZE_M=block_size_m,
@@ -500,25 +396,26 @@ def launch_gemm2_kernel(
     )
     return output
 
+
 def gemm2(
-    gemm1_output_fp8_list: List[torch.Tensor],
-    # gemm1_output_scale_list: List[torch.Tensor],
-    gemm2_weights_list: List[torch.Tensor],
-    gemm2_weights_scale_list: List[torch.Tensor],
-    permute_weights_list: List[torch.Tensor],
-    permute_token_idx_list: List[torch.Tensor],
+    gemm1_output,
+    offset,
+    gemm2_weights,
+    gemm2_weights_scale,
+    permute_weights,
+    permute_token_idx,
     seq_len: int
 ):
         
-    output = torch.zeros((seq_len, 7168), device=gemm1_output_fp8_list[0].device, dtype=torch.float32)
+    output = torch.zeros((seq_len, 7168), device=gemm1_output.device, dtype=torch.float32)
 
     launch_gemm2_kernel(
-        a_list=gemm1_output_fp8_list,
-        # a_scale_list=gemm1_output_scale_list,
-        b_list=gemm2_weights_list,
-        b_scale_list=gemm2_weights_scale_list,
-        permute_weights_list=permute_weights_list,
-        permute_token_idx_list=permute_token_idx_list,
+        gemm1_output,
+        offset,
+        gemm2_weights,
+        gemm2_weights_scale,
+        permute_weights,
+        permute_token_idx,
         output=output,
         block_size_m=32,
         block_size_n=128,
@@ -526,7 +423,6 @@ def gemm2(
     )
 
     return output.to(torch.bfloat16)
-
 
 #################################################################################
 #################################################################################
@@ -1241,6 +1137,7 @@ my_permute = load_inline(
     cpp_sources=permute_cpp_src,
     functions=["countExpertWrapper", "permuteWrapper", "moePermuteCopyFp8Wrapper", "countExpertAndOffsetsWrapper"]
 )
+
 print("load succ")
 
 def alloc_fn(size: int, alignment: int, stream):
@@ -1659,7 +1556,7 @@ def fused_impl_permute(
 ):
     expert_cnts, offsets, total_valid_tokens = my_permute.countExpertAndOffsetsWrapper(routing_idx, local_expert_offset)
     permute_token_idx, permute_weight = my_permute.permuteWrapper(routing_idx, routing_weights, offsets, total_valid_tokens, local_expert_offset)
-    return expert_cnts, permute_token_idx, permute_weight
+    return expert_cnts, permute_token_idx, permute_weight, total_valid_tokens
 
 def torch_copy_impl(
     hidden_states,
@@ -1698,9 +1595,11 @@ def fused_moe(
     # print(routing_weights)
 
     # 2. permute
-    expert_cnts, permute_token_idx, permute_weight = fused_impl_permute(routing_idx, routing_weights, local_expert_offset)
-    counts_cpu = expert_cnts.to(device="cpu", dtype=torch.int64).tolist()
-    if sum(counts_cpu) == 0:
+    expert_cnts, permute_token_idx, permute_weight, total_valid_tokens = fused_impl_permute(routing_idx, routing_weights, local_expert_offset)
+    # counts_cpu = expert_cnts.to(device="cpu", dtype=torch.int64).tolist()
+    offset = torch.cat([torch.tensor([0], device=expert_cnts.device), expert_cnts.cumsum(dim=0)]).to(torch.int32)
+    num_valid_tokens = total_valid_tokens
+    if num_valid_tokens == 0:
         print("No tokens routed to local experts.")
         return torch.zeros_like(hidden_states)
 
@@ -1711,67 +1610,26 @@ def fused_moe(
     # return
     # permute_hidden_states = fused_copy_impl(hidden_states, permute_token_idx)
     permute_hidden_states = torch_copy_impl(hidden_states, permute_token_idx)
+    permute_hidden_states_scale = hidden_states_scale.index_select(1, permute_token_idx).contiguous()
 
     # 4. gemm1 & activation
-    num_experts = gemm1_weights.shape[0]
-    offsets_cpu = [0] * num_experts
-    running = 0
-    for e, cnt in enumerate(counts_cpu):
-        offsets_cpu[e] = running
-        running += cnt
-
-    permute_hidden_states_list = []
-    permute_hidden_states_scale_list = []
-    permute_weight_list = []
-    permute_token_idx_list = []
-    gemm1_weights_list = []
-    gemm1_weights_scale_list = []
-    gemm2_weights_list = []
-    gemm2_weights_scale_list = []
-
-    for e, s_i in enumerate(counts_cpu):
-        if s_i == 0:
-            continue
-        start = offsets_cpu[e]
-        end = start + s_i
-        # print(f"Expert {e}: token count = {s_i}")
-        permute_hidden_states_list.append(permute_hidden_states[start:end])
-        permute_weight_list.append(permute_weight[start:end])
-        token_idx = permute_token_idx[start:end]
-        permute_token_idx_list.append(token_idx)
-        permute_hidden_states_scale_list.append(hidden_states_scale.index_select(1, token_idx).contiguous())
-        gemm1_weights_list.append(gemm1_weights[e])
-        gemm1_weights_scale_list.append(gemm1_weights_scale[e])
-        gemm2_weights_list.append(gemm2_weights[e])
-        gemm2_weights_scale_list.append(gemm2_weights_scale[e])
-
-    # G1 = permute_hidden_states_list[0] @ gemm1_weights_list[0].t()
-    # X1 = G1[:, :I]                                         # [Tk, I]
-    # X2 = G1[:, I:]                                         # [Tk, I]
-    # silu_X2 = X2 / (1.0 + torch.exp(-X2))                  # [Tk, I]
-    # C = silu_X2 * X1
-    # return C
-    gemm1_output_list, gemm1_output_scale_list = gemm1(
-        permute_hidden_states_list,
-        permute_hidden_states_scale_list,
-        gemm1_weights_list,
-        gemm1_weights_scale_list,
+    gemm1_output = gemm1(
+        permute_hidden_states,
+        permute_hidden_states_scale,
+        offset,
+        gemm1_weights,
+        gemm1_weights_scale
     )
-    # return gemm1_output_fp8_list[0]
-
-    # print(gemm1_output_list[0][0][:10])
-    # print(gemm1_output_scale_list[0])
-    # return gemm1_output_list[0][0], gemm1_output_scale_list[0]
     
     # 5. gemm2 & output
     output = gemm2(
-        gemm1_output_list,
-        # gemm1_output_scale_list,
-        gemm2_weights_list,
-        gemm2_weights_scale_list,
-        permute_weight_list,
-        permute_token_idx_list,
-        seq_len=hidden_states.size(0)
+        gemm1_output,
+        offset,
+        gemm2_weights,
+        gemm2_weights_scale,
+        permute_weight,
+        permute_token_idx,
+        seq_len=hidden_states.size(0),
     )
 
     # print("*************** fused over *****************\n")
