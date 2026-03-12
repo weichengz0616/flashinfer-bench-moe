@@ -762,7 +762,7 @@ __global__ void countExpertKernel(
 }
 
 __global__ void exclusiveScan32Kernel(
-    const int* __restrict__ expert_counts, // [32]
+    int* __restrict__ expert_counts, // [32]
     int* __restrict__ expert_offsets,      // [32]
     int* __restrict__ total_tokens         // [1]
 ) {
@@ -790,8 +790,10 @@ __global__ void exclusiveScan32Kernel(
 
     if (tid < 32) {
         expert_offsets[tid] = (tid == 0) ? 0 : temp[tid - 1];
+        expert_counts[tid] = expert_offsets[tid];
     }
     if (tid == 31) {
+        expert_offsets[32] = temp[31];
         total_tokens[0] = temp[31];
     }
 }
@@ -885,7 +887,7 @@ void launchCountExpertAndOffsetsKernel(
     );
 
     exclusiveScan32Kernel<<<1, 32>>>(
-        static_cast<const int*>(expert_counts),
+        static_cast<int*>(expert_counts),
         static_cast<int*>(expert_offsets),
         static_cast<int*>(total_tokens)
     );
@@ -1014,7 +1016,7 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> countExpertAndOffsetsWrapper(
         torch::dtype(torch::kInt32).device(routing_idx.device())
     );
     auto expert_offsets = torch::empty(
-        {32},
+        {33},
         torch::dtype(torch::kInt32).device(routing_idx.device())
     );
     auto total_tokens_device = torch::empty(
@@ -1555,8 +1557,8 @@ def fused_impl_permute(
     local_expert_offset
 ):
     expert_cnts, offsets, total_valid_tokens = my_permute.countExpertAndOffsetsWrapper(routing_idx, local_expert_offset)
-    permute_token_idx, permute_weight = my_permute.permuteWrapper(routing_idx, routing_weights, offsets, total_valid_tokens, local_expert_offset)
-    return expert_cnts, permute_token_idx, permute_weight, total_valid_tokens
+    permute_token_idx, permute_weight = my_permute.permuteWrapper(routing_idx, routing_weights, expert_cnts, total_valid_tokens, local_expert_offset)
+    return offsets, permute_token_idx, permute_weight, total_valid_tokens
 
 def torch_copy_impl(
     hidden_states,
@@ -1595,9 +1597,7 @@ def fused_moe(
     # print(routing_weights)
 
     # 2. permute
-    expert_cnts, permute_token_idx, permute_weight, total_valid_tokens = fused_impl_permute(routing_idx, routing_weights, local_expert_offset)
-    # counts_cpu = expert_cnts.to(device="cpu", dtype=torch.int64).tolist()
-    offset = torch.cat([torch.tensor([0], device=expert_cnts.device), expert_cnts.cumsum(dim=0)]).to(torch.int32)
+    offset, permute_token_idx, permute_weight, total_valid_tokens = fused_impl_permute(routing_idx, routing_weights, local_expert_offset)
     num_valid_tokens = total_valid_tokens
     if num_valid_tokens == 0:
         print("No tokens routed to local experts.")
