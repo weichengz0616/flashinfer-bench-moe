@@ -23,6 +23,7 @@ def gemm1_kernel(
     a_offset_ptr, # [33], int32
     b_base_ptr, # [32, 4096, 7168], fp8
     b_scale_base_ptr, # [32, 4096//128, 7168//128], fp32
+    seq_len,
     # output
     c_base_ptr, # [sum(s_i), 2048], fp32
     # other
@@ -112,7 +113,7 @@ def gemm1_kernel(
                     )
                     
                     # 获取当前 128x128 block 的缩放因子
-                    a_scale_idx = a_scale_ptr + offs_am + kk * num_valid_tokens + tl.arange(0, BLOCK_SIZE_M)
+                    a_scale_idx = a_scale_ptr + offs_am + kk * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
                     a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
                     b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
@@ -167,6 +168,7 @@ def launch_gemm1_kernel(
     offset: torch.tensor, # [33], int32, 每个 expert 处理的行数的前缀和，最后一个元素是 sum(s)
     gemm1_weights: torch.tensor, # [32, 4096, 7168], fp8
     gemm1_weights_scale: torch.tensor, # [32, 4096//128, 7168//128], fp32
+    seq_len,
     output: torch.tensor, # [sum(s), 2048], fp32
     # out_scale_list: Sequence[torch.Tensor],
     *,
@@ -187,6 +189,7 @@ def launch_gemm1_kernel(
         a_offset_ptr=offset,
         b_base_ptr=gemm1_weights,
         b_scale_base_ptr=gemm1_weights_scale,
+        seq_len=seq_len,
         # output
         c_base_ptr=output,
         # c_scale_ptrs,
@@ -206,11 +209,13 @@ def gemm1(
     permute_hidden_states,
     permute_hidden_states_scale,
     offset,
+    seq_len,
     gemm1_weights,
     gemm1_weights_scale,
+    output,
 ): # return [sum(s), 2048]
     
-    output = torch.empty((permute_hidden_states.shape[0], 2048), device=permute_hidden_states.device, dtype=torch.float32)
+    # output = torch.empty((permute_hidden_states.shape[0], 2048), device=permute_hidden_states.device, dtype=torch.float32)
 
     launch_gemm1_kernel(
         permute_hidden_states,
@@ -218,6 +223,7 @@ def gemm1(
         offset,
         gemm1_weights,
         gemm1_weights_scale,
+        seq_len,
         output,
         # out_scale_list,
         block_size_m=32,
@@ -404,10 +410,11 @@ def gemm2(
     gemm2_weights_scale,
     permute_weights,
     permute_token_idx,
-    seq_len: int
+    seq_len: int,
+    output,
 ):
         
-    output = torch.zeros((seq_len, 7168), device=gemm1_output.device, dtype=torch.float32)
+    # output = torch.zeros((seq_len, 7168), device=gemm1_output.device, dtype=torch.float32)
 
     launch_gemm2_kernel(
         gemm1_output,
@@ -422,7 +429,7 @@ def gemm2(
         block_size_k=128,
     )
 
-    return output.to(torch.bfloat16)
+    return
 
 #################################################################################
 #################################################################################
@@ -430,15 +437,13 @@ def gemm2(
 #################################################################################
 
 
-fused_gating_src = """
+kernel_src = """
 #include <stdio.h>
 #include <cfloat>
 #include <cuda_bf16.h>
-
-#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
-#define CHECK_INT32(x) TORCH_CHECK((x).scalar_type() == torch::kInt32, #x " must be int32")
-#define CHECK_FLOAT32(x) TORCH_CHECK((x).scalar_type() == torch::kFloat32, #x " must be float32")
+#include <cuda_runtime.h>
+#include <cuda_fp8.h>
+#include <device_launch_parameters.h>
 
 struct FusedGatingData
 {
@@ -670,61 +675,7 @@ void launchFusedGatingKernel(
 
     fusedGatingKernel<<<num_blocks, threads_per_block>>>(data);
 }
-"""
 
-fused_gating_cpp_src = """
-#include <torch/extension.h>
-#include <ATen/ATen.h>
-#include <cstdint>
-#include <tuple>
-
-#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
-#define CHECK_INT32(x) TORCH_CHECK((x).scalar_type() == torch::kInt32, #x " must be int32")
-#define CHECK_FLOAT32(x) TORCH_CHECK((x).scalar_type() == torch::kFloat32, #x " must be float32")
-
-void launchFusedGatingKernel(
-    void* routing_logits,
-    void* routing_bias,
-    float routing_scaling_factor,
-    void* routing_idx,
-    void* routing_weights,
-    int seq_len
-);
-
-
-std::tuple<torch::Tensor, torch::Tensor> fusedGatingWrapper(
-    torch::Tensor routing_logits, 
-    torch::Tensor routing_bias, 
-    float routing_scaling_factor
-) {
-    auto routing_idx = torch::empty(
-        {routing_logits.size(0), 8},
-        torch::dtype(torch::kInt32).device(routing_logits.device())
-    );
-    auto routing_weights = torch::empty(
-        {routing_logits.size(0), 8},
-        torch::dtype(torch::kFloat32).device(routing_logits.device())
-    );
-
-    
-    launchFusedGatingKernel(
-        routing_logits.data_ptr<float>(),
-        routing_bias.data_ptr<at::BFloat16>(),
-        routing_scaling_factor,
-        routing_idx.data_ptr<int>(),
-        routing_weights.data_ptr<float>(),
-        routing_logits.size(0)
-    );
-
-    return std::make_tuple(routing_idx, routing_weights);
-}
-"""
-
-permute_src = """
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-#include <device_launch_parameters.h>
 
 __global__ void countExpertKernel(
     const int* __restrict__ routing_idx, // [seq_len, 8]
@@ -829,45 +780,36 @@ __global__ void permuteKernel(
 }
 
 
-__global__ void moe_permute_copy_fp8_kernel(
-    const __nv_fp8_e4m3* __restrict__ input,    // [S, 7168]
-    const int* __restrict__ permuted_token_idx, // [TotalValidTokens]
-    __nv_fp8_e4m3* __restrict__ output,          // [TotalValidTokens, 7168]
-    int TotalValidTokens
+__global__ void moe_permute_copy_fp8_with_scale_kernel(
+    const __nv_fp8_e4m3* __restrict__ input,        // [S, 7168]
+    const float* __restrict__ input_scale,          // [56, S]
+    const int* __restrict__ permuted_token_idx,     // [TotalValidTokens]
+    __nv_fp8_e4m3* __restrict__ output,             // [TotalValidTokens, 7168]
+    float* __restrict__ output_scale,               // [56, TotalValidTokens]
+    int* __restrict__ offset,                     // [33]
+    int input_seq_len
 ) {
     const int HIDDEN_DIM = 7168;
+    const int NUM_HIDDEN_BLOCKS = 56;
     const int VEC_SIZE = 16; // 128 bit / 8 bit = 16 elements per uint4
-    
-    // 1个 block 处理 1个 token
-    int out_row_idx = blockIdx.x; 
-    if (out_row_idx >= TotalValidTokens) return;
+
+    int out_row_idx = blockIdx.x;
+    if (out_row_idx >= offset[32]) return;
 
     int src_row_idx = permuted_token_idx[out_row_idx];
 
     const uint4* src_ptr4 = reinterpret_cast<const uint4*>(input + src_row_idx * HIDDEN_DIM);
     uint4* dst_ptr4 = reinterpret_cast<uint4*>(output + out_row_idx * HIDDEN_DIM);
 
-    // 256 个 thread
     for (int v = threadIdx.x; v < HIDDEN_DIM / VEC_SIZE; v += blockDim.x) {
         dst_ptr4[v] = src_ptr4[v];
     }
+
+    for (int hb = threadIdx.x; hb < NUM_HIDDEN_BLOCKS; hb += blockDim.x) {
+        output_scale[hb * input_seq_len * 8 + out_row_idx] = input_scale[hb * input_seq_len + src_row_idx];
+    }
 }
 
-void launchCountExpertKernel(
-    void* routing_idx,
-    void* expert_counts,
-    int seq_len,
-    int local_expert_offset
-) {
-    constexpr int threads_per_block = 256;
-    const int num_blocks = (seq_len + threads_per_block - 1) / threads_per_block;
-    countExpertKernel<<<num_blocks, threads_per_block>>>(
-        static_cast<const int*>(routing_idx),
-        static_cast<int*>(expert_counts),
-        seq_len,
-        local_expert_offset
-    );
-}
 
 void launchCountExpertAndOffsetsKernel(
     void* routing_idx,
@@ -915,24 +857,31 @@ void launchPermuteKernel(
     );
 }
 
-void launchMoePermuteCopyFp8Kernel(
+
+void launchMoePermuteCopyFp8WithScaleKernel(
     void* input,
+    void* input_scale,
     void* permuted_token_idx,
     void* output,
-    int total_valid_tokens
+    void* output_scale,
+    void* offset,
+    int input_seq_len
 ) {
     constexpr int threads_per_block = 256;
-    const int num_blocks = total_valid_tokens;
-    moe_permute_copy_fp8_kernel<<<num_blocks, threads_per_block>>>(
+    const int num_blocks = input_seq_len * 8;
+    moe_permute_copy_fp8_with_scale_kernel<<<num_blocks, threads_per_block>>>(
         static_cast<const __nv_fp8_e4m3*>(input),
+        static_cast<const float*>(input_scale),
         static_cast<const int*>(permuted_token_idx),
         static_cast<__nv_fp8_e4m3*>(output),
-        total_valid_tokens
+        static_cast<float*>(output_scale),
+        static_cast<int*>(offset),
+        input_seq_len
     );
 }
 """
 
-permute_cpp_src = """
+cpp_src = """
 #include <torch/extension.h>
 #include <ATen/ATen.h>
 #include <cstdint>
@@ -943,11 +892,13 @@ permute_cpp_src = """
 #define CHECK_INT32(x) TORCH_CHECK((x).scalar_type() == torch::kInt32, #x " must be int32")
 #define CHECK_FLOAT32(x) TORCH_CHECK((x).scalar_type() == torch::kFloat32, #x " must be float32")
 
-void launchCountExpertKernel(
+void launchFusedGatingKernel(
+    void* routing_logits,
+    void* routing_bias,
+    float routing_scaling_factor,
     void* routing_idx,
-    void* expert_counts,
-    int seq_len,
-    int local_expert_offset
+    void* routing_weights,
+    int seq_len
 );
 
 void launchCountExpertAndOffsetsKernel(
@@ -969,39 +920,46 @@ void launchPermuteKernel(
     int local_expert_offset
 );
 
-void launchMoePermuteCopyFp8Kernel(
+
+void launchMoePermuteCopyFp8WithScaleKernel(
     void* input,
+    void* input_scale,
     void* permuted_token_idx,
     void* output,
-    int total_valid_tokens
+    void* output_scale,
+    void* offset,
+    int input_seq_len
 );
 
-torch::Tensor countExpertWrapper(
-    torch::Tensor routing_idx,
-    int64_t local_expert_offset
+
+std::tuple<torch::Tensor, torch::Tensor> fusedGatingWrapper(
+    torch::Tensor routing_logits, 
+    torch::Tensor routing_bias, 
+    float routing_scaling_factor
 ) {
-    CHECK_CUDA(routing_idx);
-    CHECK_CONTIGUOUS(routing_idx);
-    CHECK_INT32(routing_idx);
-    TORCH_CHECK(routing_idx.dim() == 2, "routing_idx must be [seq_len, 8]");
-    TORCH_CHECK(routing_idx.size(1) == 8, "routing_idx second dim must be 8");
-
-    auto expert_counts = torch::zeros(
-        {32},
-        torch::dtype(torch::kInt32).device(routing_idx.device())
+    auto routing_idx = torch::empty(
+        {routing_logits.size(0), 8},
+        torch::dtype(torch::kInt32).device(routing_logits.device())
+    );
+    auto routing_weights = torch::empty(
+        {routing_logits.size(0), 8},
+        torch::dtype(torch::kFloat32).device(routing_logits.device())
     );
 
-    launchCountExpertKernel(
+    
+    launchFusedGatingKernel(
+        routing_logits.data_ptr<float>(),
+        routing_bias.data_ptr<at::BFloat16>(),
+        routing_scaling_factor,
         routing_idx.data_ptr<int>(),
-        expert_counts.data_ptr<int>(),
-        static_cast<int>(routing_idx.size(0)),
-        static_cast<int>(local_expert_offset)
+        routing_weights.data_ptr<float>(),
+        routing_logits.size(0)
     );
 
-    return expert_counts;
+    return std::make_tuple(routing_idx, routing_weights);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, int64_t> countExpertAndOffsetsWrapper(
+std::tuple<torch::Tensor, torch::Tensor> countExpertAndOffsetsWrapper(
     torch::Tensor routing_idx,
     int64_t local_expert_offset
 ) {
@@ -1033,11 +991,11 @@ std::tuple<torch::Tensor, torch::Tensor, int64_t> countExpertAndOffsetsWrapper(
         static_cast<int>(local_expert_offset)
     );
 
-    const int64_t total_tokens = static_cast<int64_t>(
-        total_tokens_device.cpu().item<int>()
-    );
+    // const int64_t total_tokens = static_cast<int64_t>(
+    //     total_tokens_device.cpu().item<int>()
+    // );
 
-    return std::make_tuple(expert_counts, expert_offsets, total_tokens);
+    return std::make_tuple(expert_counts, expert_offsets);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> permuteWrapper(
@@ -1086,58 +1044,185 @@ std::tuple<torch::Tensor, torch::Tensor> permuteWrapper(
     return std::make_tuple(out_token_idx, out_weights);
 }
 
-torch::Tensor moePermuteCopyFp8Wrapper(
+std::tuple<torch::Tensor, torch::Tensor> moePermuteCopyFp8WithScaleWrapper(
     torch::Tensor input,
-    torch::Tensor permuted_token_idx
+    torch::Tensor input_scale,
+    torch::Tensor permuted_token_idx,
+    torch::Tensor offset,
+    torch::Tensor output,
+    torch::Tensor output_scale
 ) {
     CHECK_CUDA(input);
+    CHECK_CUDA(input_scale);
     CHECK_CUDA(permuted_token_idx);
+    CHECK_CUDA(offset);
     CHECK_CONTIGUOUS(input);
+    CHECK_CONTIGUOUS(input_scale);
     CHECK_CONTIGUOUS(permuted_token_idx);
     CHECK_INT32(permuted_token_idx);
+    CHECK_INT32(offset);
+    CHECK_FLOAT32(input_scale);
 
     TORCH_CHECK(input.dim() == 2, "input must be [S, 7168]");
     TORCH_CHECK(input.size(1) == 7168, "input second dim must be 7168");
     TORCH_CHECK(input.element_size() == 1, "input must be 1-byte dtype for fp8 kernel");
+    TORCH_CHECK(input_scale.dim() == 2, "input_scale must be [56, S]");
+    TORCH_CHECK(input_scale.size(0) == 56, "input_scale first dim must be 56");
+    TORCH_CHECK(input_scale.size(1) == input.size(0), "input_scale second dim must equal input seq len");
     TORCH_CHECK(permuted_token_idx.dim() == 1, "permuted_token_idx must be [TotalValidTokens]");
 
-    const auto total_valid_tokens = permuted_token_idx.size(0);
-    auto output = torch::empty(
-        {total_valid_tokens, input.size(1)},
-        torch::dtype(input.scalar_type()).device(input.device())
-    );
+    // const auto total_valid_tokens = permuted_token_idx.size(0);
+    // auto output = torch::empty(
+    //     {total_valid_tokens, input.size(1)},
+    //     torch::dtype(input.scalar_type()).device(input.device())
+    // );
+    // auto output_scale = torch::empty(
+    //     {input_scale.size(0), total_valid_tokens},
+    //     torch::dtype(torch::kFloat32).device(input_scale.device())
+    // );
 
-    launchMoePermuteCopyFp8Kernel(
+    launchMoePermuteCopyFp8WithScaleKernel(
         input.data_ptr(),
+        input_scale.data_ptr<float>(),
         permuted_token_idx.data_ptr<int>(),
         output.data_ptr(),
-        static_cast<int>(total_valid_tokens)
+        output_scale.data_ptr<float>(),
+        offset.data_ptr<int>(),
+        static_cast<int>(input.size(0))
     );
 
-    return output;
+    return std::make_tuple(output, output_scale);
 }
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fusedRoutePermuteCopyWrapper(
+    torch::Tensor routing_logits,
+    torch::Tensor routing_bias,
+    float routing_scaling_factor,
+    torch::Tensor hidden_states,
+    torch::Tensor hidden_states_scale,
+    int64_t local_expert_offset
+) {
+    CHECK_CUDA(routing_logits);
+    CHECK_CUDA(routing_bias);
+    CHECK_CUDA(hidden_states);
+    CHECK_CUDA(hidden_states_scale);
+    CHECK_CONTIGUOUS(routing_logits);
+    CHECK_CONTIGUOUS(routing_bias);
+    CHECK_CONTIGUOUS(hidden_states);
+    CHECK_CONTIGUOUS(hidden_states_scale);
+    CHECK_FLOAT32(routing_logits);
+    CHECK_FLOAT32(hidden_states_scale);
+
+    TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be [seq_len, 256]");
+    TORCH_CHECK(routing_logits.size(1) == 256, "routing_logits second dim must be 256");
+    TORCH_CHECK(routing_bias.numel() == 256, "routing_bias must have 256 elements");
+    TORCH_CHECK(hidden_states.dim() == 2, "hidden_states must be [seq_len, 7168]");
+    TORCH_CHECK(hidden_states.size(1) == 7168, "hidden_states second dim must be 7168");
+    TORCH_CHECK(hidden_states.element_size() == 1, "hidden_states must be 1-byte dtype for fp8 kernel");
+    TORCH_CHECK(hidden_states_scale.dim() == 2, "hidden_states_scale must be [56, seq_len]");
+    TORCH_CHECK(hidden_states_scale.size(0) == 56, "hidden_states_scale first dim must be 56");
+    TORCH_CHECK(hidden_states_scale.size(1) == hidden_states.size(0), "hidden_states_scale second dim must equal hidden_states seq_len");
+    TORCH_CHECK(routing_logits.size(0) == hidden_states.size(0), "routing_logits and hidden_states seq_len must match");
+
+    const auto seq_len = static_cast<int>(routing_logits.size(0));
+
+    auto routing_idx = torch::empty(
+        {routing_logits.size(0), 8},
+        torch::dtype(torch::kInt32).device(routing_logits.device())
+    );
+    auto routing_weights = torch::empty(
+        {routing_logits.size(0), 8},
+        torch::dtype(torch::kFloat32).device(routing_logits.device())
+    );
+
+    auto expert_counts = torch::zeros(
+        {32},
+        torch::dtype(torch::kInt32).device(routing_logits.device())
+    );
+    auto expert_offsets = torch::empty(
+        {33},
+        torch::dtype(torch::kInt32).device(routing_logits.device())
+    );
+    auto total_tokens_device = torch::empty(
+        {1},
+        torch::dtype(torch::kInt32).device(routing_logits.device())
+    );
+
+    const int64_t total_tokens = static_cast<int64_t>(seq_len) * 8;
+    auto permute_token_idx = torch::empty(
+        {total_tokens},
+        torch::dtype(torch::kInt32).device(routing_idx.device())
+    );
+    auto permute_weight = torch::empty(
+        {total_tokens},
+        torch::dtype(torch::kFloat32).device(routing_idx.device())
+    );
+
+    auto permute_hidden_states = torch::empty(
+        {total_tokens, hidden_states.size(1)},
+        torch::dtype(hidden_states.scalar_type()).device(hidden_states.device())
+    );
+    auto permute_hidden_states_scale = torch::empty(
+        {hidden_states_scale.size(0), total_tokens},
+        torch::dtype(torch::kFloat32).device(hidden_states_scale.device())
+    );
+
+    launchFusedGatingKernel(
+        routing_logits.data_ptr<float>(),
+        routing_bias.data_ptr<at::BFloat16>(),
+        routing_scaling_factor,
+        routing_idx.data_ptr<int>(),
+        routing_weights.data_ptr<float>(),
+        seq_len
+    );
+
+    launchCountExpertAndOffsetsKernel(
+        routing_idx.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        expert_offsets.data_ptr<int>(),
+        total_tokens_device.data_ptr<int>(),
+        seq_len,
+        static_cast<int>(local_expert_offset)
+    );
+
+    launchPermuteKernel(
+        routing_idx.data_ptr<int>(),
+        routing_weights.data_ptr<float>(),
+        expert_counts.data_ptr<int>(),
+        permute_token_idx.data_ptr<int>(),
+        permute_weight.data_ptr<float>(),
+        seq_len,
+        static_cast<int>(local_expert_offset)
+    );
+
+    launchMoePermuteCopyFp8WithScaleKernel(
+        hidden_states.data_ptr(),
+        hidden_states_scale.data_ptr<float>(),
+        permute_token_idx.data_ptr<int>(),
+        permute_hidden_states.data_ptr(),
+        permute_hidden_states_scale.data_ptr<float>(),
+        expert_offsets.data_ptr<int>(),
+        seq_len
+    );
+
+    return std::make_tuple(
+        expert_offsets,
+        permute_token_idx,
+        permute_weight,
+        permute_hidden_states,
+        permute_hidden_states_scale
+    );
+}
+
 """
 
-# JIT 编译
-# my_lib = load(
-#     name="fused_gating",
-#     sources=["wrapper.cpp", "fused_gating.cu", "permute.cu"],
-#     verbose=True
-# )
 
-my_gating = load_inline(
+my_lib = load_inline(
     name = "fused_gating",
-    cuda_sources=fused_gating_src,
-    cpp_sources=fused_gating_cpp_src,
-    functions=["fusedGatingWrapper"],
+    cuda_sources=kernel_src,
+    cpp_sources=cpp_src,
+    functions=["fusedRoutePermuteCopyWrapper"],
     verbose=True
-)
-
-my_permute = load_inline(
-    name = "permute",
-    cuda_sources=permute_src,
-    cpp_sources=permute_cpp_src,
-    functions=["countExpertWrapper", "permuteWrapper", "moePermuteCopyFp8Wrapper", "countExpertAndOffsetsWrapper"]
 )
 
 print("load succ")
@@ -1336,67 +1421,6 @@ def run(
 
     return output.to(torch.bfloat16)
 
-def torch_impl_gating(routing_logits, routing_bias, routing_scaling_factor):
-    H = 7168
-    I = 2048
-    E_global = routing_logits.shape[1]
-    T = routing_logits.shape[0]
-
-    assert H == 7168, "hidden_size must be 7168" 
-    assert I == 2048, "intermediate_size must be 2048"
-    assert E_global == 256, "num_experts must be 256"
-
-    # Routing constants
-    TOP_K = 8
-    N_GROUP = 8
-    TOPK_GROUP = 4
-
-
-    logits = routing_logits.to(torch.float32)                      # [T, E_global]
-    bias = routing_bias.to(torch.float32).reshape(-1)              # [E_global]
-
-    # Sigmoid
-    s = 1.0 / (1.0 + torch.exp(-logits))                       # [T, E]
-    s_with_bias = s + bias                                     # [T, E] (broadcast)
-    # print(s_with_bias)
-
-    # Grouping
-    group_size = E_global // N_GROUP # 32
-    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)    # [T, 8, 32]
-
-    # Group scores = sum of top-2 values within each group
-    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)  # [T, 8, 2]
-    group_scores = top2_vals.sum(dim=2)                        # [T, 8]
-    # print(f"group_scores: {top2_vals}")
-
-    # Select topk_group groups → group mask
-    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)  # [T, 4]
-    # print(f"group_idx: {group_idx}")
-    group_mask = torch.zeros_like(group_scores)                # [T, 8]
-    group_mask.scatter_(1, group_idx, 1.0)
-    score_mask = group_mask.unsqueeze(2).expand(T, N_GROUP, group_size).reshape(T, E_global)  # [T, E]
-
-    # Global top-k (within kept groups), based on s_with_bias
-    neg_inf = torch.finfo(torch.float32).min
-    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)                  # [T, E]
-    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=True)  # [T, 8]
-    # print(s_with_bias[0][71])
-
-    # Combination weights: use s (without bias) for normalization
-    M = torch.zeros_like(s)                                    # [T, E]
-    M.scatter_(1, topk_idx, 1.0)                               # 0/1 mask
-    weights = s * M                                            # [T, E]
-    weights_sum = weights.sum(dim=1, keepdim=True) + 1e-20
-    # print(weights)
-    weights = (weights / weights_sum) * routing_scaling_factor  # [T, E]
-
-    topk_weights = torch.gather(weights, 1, topk_idx)
-    return topk_idx, topk_weights
-
-def fused_impl_gating(routing_logits, routing_bias, routing_scaling_factor):
-    routing_idx, routing_weights = my_gating.fusedGatingWrapper(routing_logits, routing_bias, routing_scaling_factor)
-    return routing_idx, routing_weights
-
 def test_time(impl_func, *args):
     # warmup
     for _ in range(20):
@@ -1409,173 +1433,6 @@ def test_time(impl_func, *args):
     end_time = time.time()
     avg_time = (end_time - start_time) / n_iters
     print(f"Average execution time over {n_iters} runs: {avg_time:.6f} seconds")
-
-def test_gating():
-    print("========== test ==========")
-    torch.manual_seed(42)
-    torch.set_default_device('cuda:7')
-
-    seq_len = 20  # 示例序列长度
-    num_experts = 256
-    num_local_experts = 32  # 假设当前 Rank 负责的专家数
-    hidden_size = 7168
-    intermediate_size = 2048
-    gemm1_out_size = 4096
-
-    block_size = 128
-    num_hidden_blocks = hidden_size // block_size
-    num_intermediate_blocks = intermediate_size // block_size
-    num_gemm1_out_blocks = gemm1_out_size // block_size
-
-
-    routing_logits = torch.randn(seq_len, num_experts, dtype=torch.float32)
-    routing_bias = torch.randn(num_experts, dtype=torch.bfloat16)
-    hidden_states = torch.randn(seq_len, hidden_size).to(torch.float8_e4m3fn)
-    hidden_states_scale = torch.randn(num_hidden_blocks, seq_len, dtype=torch.float32)
-    gemm1_weights = torch.randn(
-        num_local_experts, gemm1_out_size, hidden_size
-    ).to(torch.float8_e4m3fn)
-    gemm1_weights_scale = torch.randn(
-        num_local_experts, num_gemm1_out_blocks, num_hidden_blocks, dtype=torch.float32
-    )
-    gemm2_weights = torch.randn(
-        num_local_experts, hidden_size, intermediate_size
-    ).to(torch.float8_e4m3fn)
-    gemm2_weights_scale = torch.randn(
-        num_local_experts, num_hidden_blocks, num_intermediate_blocks, dtype=torch.float32
-    )
-    local_expert_offset = 32
-    routed_scaling_factor = 1.11
-
-    print("============ torch impl =============")
-    torch_idx, torch_weights = torch_impl_gating(routing_logits, routing_bias, routed_scaling_factor)
-    print("Torch topk indices shape:", torch_idx.shape)
-    print("Torch weights shape:", torch_weights.shape)
-
-    print("============ fused impl =============")
-    fused_idx, fused_weights = fused_impl_gating(routing_logits, routing_bias, routed_scaling_factor)
-    print("Fused topk indices shape:", fused_idx.shape)
-    print("Fused weights shape:", fused_weights.shape)
-
-
-    test_time(torch_impl_gating, routing_logits, routing_bias, routed_scaling_factor)
-    test_time(fused_impl_gating, routing_logits, routing_bias, routed_scaling_factor)
-    print((torch_idx == fused_idx).all())
-    print(torch.allclose(torch_weights, fused_weights, atol=1e-6))
-    print("==================")
-    print(f"torch indices is {torch_idx}")
-    print(f"fused indices is {fused_idx}")
-
-    def get_experts_cnt(routing_idx, local_expert_offset):
-        counts = []
-        for i in range(32):
-            mask = (routing_idx == (local_expert_offset + i))
-            count = mask.sum().item()
-            counts.append(count)
-        
-        return torch.tensor(counts, device=routing_idx.device)
-    print("torch local expert counts:", get_experts_cnt(torch_idx, local_expert_offset))
-    print("fused local expert counts:", get_experts_cnt(fused_idx, local_expert_offset))
-
-def torch_impl_permute(
-    routing_idx, 
-    routing_weights,
-    local_expert_offset
-):
-    def count(routing_idx, local_expert_offset):
-        counts = []
-        for i in range(32):
-            mask = (routing_idx == (local_expert_offset + i))
-            count = mask.sum().item()
-            counts.append(count)
-        
-        return torch.tensor(counts, device=routing_idx.device)
-    
-    def permute(
-        routing_idx,
-        routing_weights,
-        local_expert_offset,
-        counts
-    ):
-        """
-        Args:
-            routing_idx: [seq_len, 8]
-            routing_weights: [seq_len, 8]
-            local_expert_offset: int
-            counts: [32] - 预先计算好的每个 local expert 的 token 总数
-        """
-        num_local_experts = counts.size(0)
-        device = routing_idx.device
-        
-        # 1. 筛选出本地 Expert 相关的掩码
-        is_local = (routing_idx >= local_expert_offset) & (routing_idx < local_expert_offset + num_local_experts)
-        
-        # 2. 提取有效数据并转为本地索引 [0, 31]
-        valid_expert_ids = (routing_idx[is_local] - local_expert_offset).long()
-        valid_weights = routing_weights[is_local]
-        
-        # 生成原始 token 索引 (0 到 seq_len-1)
-        token_indices = torch.arange(routing_idx.size(0), device=device).view(-1, 1).expand_as(routing_idx)
-        valid_token_ids = token_indices[is_local]
-
-        # 3. 计算每个 token 在其所属 expert 组内的偏移量 (Rank)
-        # 例如：如果 valid_expert_ids 是 [0, 1, 0, 2]，那么对应的 rank 是 [0, 0, 1, 0]
-        # 我们通过对每个 expert ID 进行累加计数来实现
-        # 这里使用一个小技巧：对 one-hot 后的结果做 cumsum
-        one_hot = torch.nn.functional.one_hot(valid_expert_ids, num_classes=num_local_experts)
-        expert_rank = torch.cumsum(one_hot, dim=0) * one_hot
-        expert_rank = expert_rank.sum(dim=-1) - 1 # 减 1 变为从 0 开始的索引
-
-        # 4. 计算每个 Expert 在输出 tensor 中的起始全局偏移量
-        # cumulative_offsets[i] 表示第 i 个 expert 在 permute_token_idx 中的开始位置
-        expert_offsets = torch.cat([torch.tensor([0], device=device), torch.cumsum(counts, dim=0)[:-1]])
-
-        # 5. 计算最终在 permute_token_idx 中的位置
-        # 最终位置 = 该 Expert 的起始位置 + 该 Token 在 Expert 内部的序号
-        final_positions = expert_offsets[valid_expert_ids] + expert_rank
-
-        # 6. 放置数据
-        num_total_valid = counts.sum().item()
-        permute_token_idx = torch.empty(num_total_valid, dtype=torch.long, device=device)
-        permute_weight = torch.empty(num_total_valid, dtype=routing_weights.dtype, device=device)
-
-        permute_token_idx.scatter_(0, final_positions, valid_token_ids)
-        permute_weight.scatter_(0, final_positions, valid_weights)
-
-        return permute_token_idx, permute_weight
-
-    expert_cnts = count(routing_idx, local_expert_offset)
-    print("torch Expert counts:", expert_cnts)
-
-    permute_token_idx, permute_weight = permute(routing_idx, routing_weights, local_expert_offset, expert_cnts)
-    
-    return expert_cnts, permute_token_idx, permute_weight
-
-def fused_impl_permute(
-    routing_idx, 
-    routing_weights,
-    local_expert_offset
-):
-    expert_cnts, offsets, total_valid_tokens = my_permute.countExpertAndOffsetsWrapper(routing_idx, local_expert_offset)
-    permute_token_idx, permute_weight = my_permute.permuteWrapper(routing_idx, routing_weights, expert_cnts, total_valid_tokens, local_expert_offset)
-    return offsets, permute_token_idx, permute_weight, total_valid_tokens
-
-def torch_copy_impl(
-    hidden_states,
-    permute_token_idx,
-):
-    # hidden_states: [seq_len, hidden_dim]
-    # permute_token_idx: [num_valid_tokens]
-    permute_hidden_states = hidden_states[permute_token_idx]
-    return permute_hidden_states
-
-def fused_copy_impl(
-    hidden_states,
-    permute_token_idx,
-):
-    permute_hidden_states = my_permute.moePermuteCopyFp8Wrapper(hidden_states, permute_token_idx)
-    return permute_hidden_states
-
 
 @torch.no_grad()
 def fused_moe(
@@ -1590,50 +1447,45 @@ def fused_moe(
     local_expert_offset: int,
     routed_scaling_factor: float,
 ):
+    seq_len = hidden_states.size(0)
+    gemm1_output = torch.empty((seq_len * 8, 2048), device=hidden_states.device, dtype=torch.float32)
+    gemm2_output = torch.zeros((seq_len, 7168), device=hidden_states.device, dtype=torch.float32)
     # print("\n*************** fused start *****************")
-    # 1. gating
-    routing_idx, routing_weights = fused_impl_gating(routing_logits, routing_bias, routed_scaling_factor)
-    # print(routing_idx)
-    # print(routing_weights)
-
-    # 2. permute
-    offset, permute_token_idx, permute_weight, total_valid_tokens = fused_impl_permute(routing_idx, routing_weights, local_expert_offset)
-    num_valid_tokens = total_valid_tokens
-    if num_valid_tokens == 0:
-        print("No tokens routed to local experts.")
-        return torch.zeros_like(hidden_states)
-
-    # 3. copy
-    # print(f"Expert counts: {expert_cnts}")
-    # print(f"Permute token indices: {permute_token_idx.shape}")
-    # print(f"Permute weights: {permute_weight.shape}")
-    # return
-    # permute_hidden_states = fused_copy_impl(hidden_states, permute_token_idx)
-    permute_hidden_states = torch_copy_impl(hidden_states, permute_token_idx)
-    permute_hidden_states_scale = hidden_states_scale.index_select(1, permute_token_idx).contiguous()
+    # 1~3. routing + fused permute + copy
+    offset, permute_token_idx, permute_weight, permute_hidden_states, permute_hidden_states_scale = my_lib.fusedRoutePermuteCopyWrapper(
+        routing_logits,
+        routing_bias,
+        routed_scaling_factor,
+        hidden_states,
+        hidden_states_scale,
+        local_expert_offset,
+    )
 
     # 4. gemm1 & activation
-    gemm1_output = gemm1(
+    gemm1(
         permute_hidden_states,
         permute_hidden_states_scale,
         offset,
+        seq_len,
         gemm1_weights,
-        gemm1_weights_scale
+        gemm1_weights_scale,
+        gemm1_output,
     )
     
     # 5. gemm2 & output
-    output = gemm2(
+    gemm2(
         gemm1_output,
         offset,
         gemm2_weights,
         gemm2_weights_scale,
         permute_weight,
         permute_token_idx,
-        seq_len=hidden_states.size(0),
+        seq_len,
+        output=gemm2_output,
     )
 
     # print("*************** fused over *****************\n")
-    return output
+    return gemm2_output.to(torch.bfloat16)
 
 def compute_error_stats(
     output: torch.Tensor, reference: torch.Tensor, cfg
