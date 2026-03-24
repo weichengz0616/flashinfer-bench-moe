@@ -25,9 +25,9 @@ def get_blk_size_m(args):
         return 128
     else:
         return 256
-@triton.heuristics({
-    "BLOCK_SIZE_M": get_blk_size_m,
-})
+# @triton.heuristics({
+#     "BLOCK_SIZE_M": get_blk_size_m,
+# })
 @triton.jit
 def gemm1_kernel(
     # input
@@ -252,15 +252,135 @@ def gemm1(
 
     return
 
+
+
+from triton.compiler import ASTSource, compile
+class gemm1Kernel:
+    def __init__(self, num_sm):
+        signature = {
+            'a_base_ptr': '*fp8e4nv',
+            'a_scale_base_ptr': '*fp32',
+            'a_offset_ptr': '*i32',
+            'b_base_ptr': '*fp8e4nv',
+            'b_scale_base_ptr': '*fp32',
+            'seq_len': 'i32',
+            'c_base_ptr': '*fp8e4nv',
+            'c_scale_base_ptr': '*fp32',
+            'NUM_SM': 'constexpr',
+            'BLOCK_SIZE_M': 'constexpr',
+            'BLOCK_SIZE_N': 'constexpr',
+            'BLOCK_SIZE_K': 'constexpr'
+        }
+
+        blk_sizes = [16, 32, 64, 128, 256]
+        constexprs_list = []
+        for blk_size in blk_sizes:
+            constexprs_list.append({
+                (8,): num_sm,
+                (9,): blk_size,
+                (10,): 128,
+                (11,): 128
+            })
+        
+        attrs = {
+            (0,): [['tt.divisibility', 16]],
+            (1,): [['tt.divisibility', 16]],
+            (2,): [['tt.divisibility', 16]],
+            (3,): [['tt.divisibility', 16]],
+            (4,): [['tt.divisibility', 16]],
+            (5,): [['tt.divisibility', 16]],
+            (6,): [['tt.divisibility', 16]],
+            (7,): [['tt.divisibility', 16]]
+        }
+
+        self.num_sm = num_sm
+        self.kernels = []
+        for constexprs in constexprs_list:
+            src = ASTSource(
+                fn=gemm1_kernel,
+                signature=signature,
+                constexprs=constexprs,
+                attrs=attrs
+            )
+            compiled_kernel = compile(src, options={
+                "num_warps": 8,
+                "num_stages": 4,
+            })
+            # compiled_kernel = compile(src)
+            self.kernels.append(compiled_kernel)
+
+    def __call__(
+            self, 
+            a_base,
+            a_scale_base,
+            a_offset,
+            b_base,
+            b_scale_base,
+            seq_len,
+            c_base,
+            c_scale_base, 
+            stream=None):
+        if stream is None:
+            device = triton.runtime.driver.active.get_current_device()
+            stream = triton.runtime.driver.active.get_current_stream(device)
+        elif hasattr(stream, "cuda_stream"):
+            # 兼容传入 torch stream 对象
+            stream = stream.cuda_stream
+
+        kernel = None
+        blk_size = None
+        if seq_len <= 100:
+            kernel = self.kernels[0]
+            blk_size = 16
+        elif seq_len <= 500:
+            kernel = self.kernels[1]
+            blk_size = 32
+        elif seq_len <= 2000:
+            kernel = self.kernels[2]
+            blk_size = 64
+        elif seq_len <= 20000:
+            kernel = self.kernels[3]
+            blk_size = 128
+        else:
+            kernel = self.kernels[4]
+            blk_size = 256
+
+        grid = (self.num_sm, 1, 1)
+        launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, seq_len, c_base, c_scale_base)
+
+        kernel.run(
+            grid[0], grid[1], grid[2],
+            stream,
+            kernel.function,
+            kernel.packed_metadata,
+            launch_metadata,
+            None,
+            None,
+            a_base,
+            a_scale_base,
+            a_offset,
+            b_base,
+            b_scale_base,
+            seq_len,
+            c_base,
+            c_scale_base,
+            self.num_sm,
+            blk_size,
+            128,
+            128,
+        )
+        return
+
+
 #################################################################################
 #################################################################################
 #################################################################################
 #################################################################################
 
 
-@triton.heuristics({
-    "BLOCK_SIZE_M": get_blk_size_m,
-})
+# @triton.heuristics({
+#     "BLOCK_SIZE_M": get_blk_size_m,
+# })
 @triton.jit
 def gemm2_kernel(
     # input
@@ -474,6 +594,133 @@ def gemm2(
     )
 
     return output
+
+
+
+class gemm2Kernel:
+    def __init__(self, num_sm):
+        signature = {
+            'a_base_ptr': '*fp8e4nv',
+            'a_scale_base_ptr': '*fp32',
+            'a_offset_ptr': '*i32',
+            'b_base_ptr': '*fp8e4nv',
+            'b_scale_base_ptr': '*fp32',
+            'permute_weights_base_ptr': '*fp32',
+            'permute_token_idx_base_ptr': '*i32',
+            'seq_len': 'i32',
+            'output_ptr': '*fp32',
+            'NUM_SM': 'constexpr',
+            'BLOCK_SIZE_M': 'constexpr',
+            'BLOCK_SIZE_N': 'constexpr',
+            'BLOCK_SIZE_K': 'constexpr'
+        }
+
+        blk_sizes = [16, 32, 64, 128, 256]
+        constexprs_list = []
+        for blk_size in blk_sizes:
+            constexprs_list.append({
+                (9,): num_sm, 
+                (10,): blk_size, 
+                (11,): 128, 
+                (12,): 128
+            })
+        
+        attrs = {
+            (0,): [['tt.divisibility', 16]],
+            (1,): [['tt.divisibility', 16]],
+            (2,): [['tt.divisibility', 16]],
+            (3,): [['tt.divisibility', 16]],
+            (4,): [['tt.divisibility', 16]],
+            (5,): [['tt.divisibility', 16]],
+            (6,): [['tt.divisibility', 16]],
+            (7,): [['tt.divisibility', 16]],
+            (8,): [['tt.divisibility', 16]]
+        }
+
+        self.num_sm = num_sm
+        self.kernels = []
+        for constexprs in constexprs_list:
+            src = ASTSource(
+                fn=gemm2_kernel,
+                signature=signature,
+                constexprs=constexprs,
+                attrs=attrs
+            )
+            compiled_kernel = compile(src, options={
+                "num_warps": 8,
+                "num_stages": 4,
+            })
+            # compiled_kernel = compile(src)
+            self.kernels.append(compiled_kernel)
+
+
+    def __call__(
+            self, 
+            a_base,
+            a_scale_base,
+            a_offset,
+            b_base,
+            b_scale_base,
+            permute_weights,
+            permute_token_idx,
+            seq_len,
+            output,
+            stream=None):
+        if stream is None:
+            device = triton.runtime.driver.active.get_current_device()
+            stream = triton.runtime.driver.active.get_current_stream(device)
+        elif hasattr(stream, "cuda_stream"):
+            # 兼容传入 torch stream 对象
+            stream = stream.cuda_stream
+
+        kernel = None
+        blk_size = None
+        if seq_len <= 100:
+            kernel = self.kernels[0]
+            blk_size = 16
+        elif seq_len <= 500:
+            kernel = self.kernels[1]
+            blk_size = 32
+        elif seq_len <= 2000:
+            kernel = self.kernels[2]
+            blk_size = 64
+        elif seq_len <= 20000:
+            kernel = self.kernels[3]
+            blk_size = 128
+        else:
+            kernel = self.kernels[4]
+            blk_size = 256
+
+        grid = (self.num_sm, 1, 1)
+        launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, permute_weights, permute_token_idx, seq_len, output)
+
+        kernel.run(
+            grid[0], grid[1], grid[2],
+            stream,
+            kernel.function,
+            kernel.packed_metadata,
+            launch_metadata,
+            None,
+            None,
+            a_base,
+            a_scale_base,
+            a_offset,
+            b_base,
+            b_scale_base,
+            permute_weights,
+            permute_token_idx,
+            seq_len,
+            output,
+            self.num_sm,
+            blk_size,
+            128,
+            128,
+        )
+        return
+
+num_sm = torch.cuda.get_device_properties(0).multi_processor_count
+gemm1_aot = gemm1Kernel(num_sm)
+gemm2_aot = gemm2Kernel(num_sm)
 
 #################################################################################
 #################################################################################
@@ -1312,6 +1559,118 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     );
 }
 
+
+void fusedRoutePermuteCopyIntoWrapper(
+    torch::Tensor routing_logits,
+    torch::Tensor routing_bias,
+    float routing_scaling_factor,
+    torch::Tensor hidden_states,
+    torch::Tensor hidden_states_scale,
+    int64_t local_expert_offset,
+    torch::Tensor routing_idx,
+    torch::Tensor routing_weights,
+    torch::Tensor expert_counts,
+    torch::Tensor expert_offsets,
+    torch::Tensor total_tokens_device,
+    torch::Tensor permute_token_idx,
+    torch::Tensor permute_weight,
+    torch::Tensor permute_hidden_states,
+    torch::Tensor permute_hidden_states_scale
+) {
+    CHECK_CUDA(routing_logits);
+    CHECK_CUDA(routing_bias);
+    CHECK_CUDA(hidden_states);
+    CHECK_CUDA(hidden_states_scale);
+    CHECK_CUDA(routing_idx);
+    CHECK_CUDA(routing_weights);
+    CHECK_CUDA(expert_counts);
+    CHECK_CUDA(expert_offsets);
+    CHECK_CUDA(total_tokens_device);
+    CHECK_CUDA(permute_token_idx);
+    CHECK_CUDA(permute_weight);
+    CHECK_CUDA(permute_hidden_states);
+    CHECK_CUDA(permute_hidden_states_scale);
+
+    CHECK_CONTIGUOUS(routing_logits);
+    CHECK_CONTIGUOUS(routing_bias);
+    CHECK_CONTIGUOUS(hidden_states);
+    CHECK_CONTIGUOUS(hidden_states_scale);
+    CHECK_CONTIGUOUS(routing_idx);
+    CHECK_CONTIGUOUS(routing_weights);
+    CHECK_CONTIGUOUS(expert_counts);
+    CHECK_CONTIGUOUS(expert_offsets);
+    CHECK_CONTIGUOUS(total_tokens_device);
+    CHECK_CONTIGUOUS(permute_token_idx);
+    CHECK_CONTIGUOUS(permute_weight);
+    CHECK_CONTIGUOUS(permute_hidden_states);
+    CHECK_CONTIGUOUS(permute_hidden_states_scale);
+
+    CHECK_FLOAT32(routing_logits);
+    CHECK_FLOAT32(hidden_states_scale);
+    CHECK_INT32(routing_idx);
+    CHECK_FLOAT32(routing_weights);
+    CHECK_INT32(expert_counts);
+    CHECK_INT32(expert_offsets);
+    CHECK_INT32(total_tokens_device);
+    CHECK_INT32(permute_token_idx);
+    CHECK_FLOAT32(permute_weight);
+    CHECK_FLOAT32(permute_hidden_states_scale);
+
+    TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be [seq_len, 256]");
+    TORCH_CHECK(routing_logits.size(1) == 256, "routing_logits second dim must be 256");
+    TORCH_CHECK(routing_bias.numel() == 256, "routing_bias must have 256 elements");
+    TORCH_CHECK(hidden_states.dim() == 2, "hidden_states must be [seq_len, 7168]");
+    TORCH_CHECK(hidden_states.size(1) == 7168, "hidden_states second dim must be 7168");
+    TORCH_CHECK(hidden_states.element_size() == 1, "hidden_states must be 1-byte dtype for fp8 kernel");
+    TORCH_CHECK(hidden_states_scale.dim() == 2, "hidden_states_scale must be [56, seq_len]");
+    TORCH_CHECK(hidden_states_scale.size(0) == 56, "hidden_states_scale first dim must be 56");
+    TORCH_CHECK(hidden_states_scale.size(1) == hidden_states.size(0), "hidden_states_scale second dim must equal hidden_states seq_len");
+    TORCH_CHECK(routing_logits.size(0) == hidden_states.size(0), "routing_logits and hidden_states seq_len must match");
+
+    const auto seq_len = static_cast<int64_t>(routing_logits.size(0));
+    const auto total_tokens = seq_len * 8;
+
+    expert_counts.zero_();
+
+    launchFusedGatingKernel(
+        routing_logits.data_ptr<float>(),
+        routing_bias.data_ptr<at::BFloat16>(),
+        routing_scaling_factor,
+        routing_idx.data_ptr<int>(),
+        routing_weights.data_ptr<float>(),
+        static_cast<int>(seq_len)
+    );
+
+    launchCountExpertAndOffsetsKernel(
+        routing_idx.data_ptr<int>(),
+        expert_counts.data_ptr<int>(),
+        expert_offsets.data_ptr<int>(),
+        total_tokens_device.data_ptr<int>(),
+        static_cast<int>(seq_len),
+        static_cast<int>(local_expert_offset)
+    );
+
+    launchPermuteKernel(
+        routing_idx.data_ptr<int>(),
+        routing_weights.data_ptr<float>(),
+        expert_counts.data_ptr<int>(),
+        permute_token_idx.data_ptr<int>(),
+        permute_weight.data_ptr<float>(),
+        static_cast<int>(seq_len),
+        static_cast<int>(local_expert_offset)
+    );
+
+    launchMoePermuteCopyFp8WithScaleKernel(
+        hidden_states.data_ptr(),
+        hidden_states_scale.data_ptr<float>(),
+        permute_token_idx.data_ptr<int>(),
+        permute_hidden_states.data_ptr(),
+        permute_hidden_states_scale.data_ptr<float>(),
+        expert_offsets.data_ptr<int>(),
+        static_cast<int>(seq_len)
+    );
+}
+
 void scatterAddWrapper(
     torch::Tensor tmp_output,
     torch::Tensor token_idx,
@@ -1353,7 +1712,7 @@ my_lib = load_inline(
     name = "fused_gating",
     cuda_sources=kernel_src,
     cpp_sources=cpp_src,
-    functions=["fusedRoutePermuteCopyWrapper", "scatterAddWrapper"],
+    functions=["fusedRoutePermuteCopyIntoWrapper", "scatterAddWrapper"],
     verbose=True
 )
 
@@ -1568,6 +1927,45 @@ def test_time(impl_func, *args):
     avg_time = (end_time - start_time) * 1000 / n_iters
     print(f"Average execution time over {n_iters} runs: {avg_time:.6f} ms")
 
+
+
+class FusedMoeWorkspace:
+    def __init__(self, seq_len: int, device: torch.device):
+        total_tokens = seq_len * 8
+        self.seq_len = seq_len
+        self.total_tokens = total_tokens
+
+        # fused_route_permute_copy_into outputs / scratch
+        self.routing_idx = torch.empty((seq_len, 8), device=device, dtype=torch.int32)
+        self.routing_weights = torch.empty((seq_len, 8), device=device, dtype=torch.float32)
+        self.expert_counts = torch.empty((32,), device=device, dtype=torch.int32)
+        self.expert_offsets = torch.empty((33,), device=device, dtype=torch.int32)
+        self.total_tokens_device = torch.empty((1,), device=device, dtype=torch.int32)
+        self.permute_token_idx = torch.empty((total_tokens,), device=device, dtype=torch.int32)
+        self.permute_weight = torch.empty((total_tokens,), device=device, dtype=torch.float32)
+        self.permute_hidden_states = torch.empty((total_tokens, 7168), device=device, dtype=torch.float8_e4m3fn)
+        self.permute_hidden_states_scale = torch.empty((56, total_tokens), device=device, dtype=torch.float32)
+
+        # gemm / reduce outputs
+        self.gemm1_output = torch.empty((total_tokens, 2048), device=device, dtype=torch.float8_e4m3fn)
+        self.gemm1_output_scale = torch.empty((2048 // 128, total_tokens), device=device, dtype=torch.float32)
+        self.gemm2_output = torch.empty((total_tokens, 7168), device=device, dtype=torch.float32)
+        self.output = torch.empty((seq_len, 7168), device=device, dtype=torch.float32)
+
+        self.stream = torch.cuda.current_stream()
+
+
+_MAX_SEQ_LEN = 15000
+_FUSED_MOE_WORKSPACE = None
+
+
+def _get_fused_moe_workspace(device: torch.device) -> FusedMoeWorkspace:
+    global _FUSED_MOE_WORKSPACE
+    if _FUSED_MOE_WORKSPACE is None:
+        _FUSED_MOE_WORKSPACE = FusedMoeWorkspace(_MAX_SEQ_LEN, device)
+    return _FUSED_MOE_WORKSPACE
+
+
 @torch.no_grad()
 def fused_moe(
     routing_logits: torch.Tensor,
@@ -1581,60 +1979,87 @@ def fused_moe(
     local_expert_offset: int,
     routed_scaling_factor: float,
 ):
-    # 4090 - 128
-    # H800 - 112 ?
-    # H100 - 132
-    # B200 - 160 ?
-    num_sm = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
     seq_len = hidden_states.size(0)
-    gemm1_output = torch.empty((seq_len * 8, 2048), device=hidden_states.device, dtype=torch.float8_e4m3fn)
-    gemm1_output_scale = torch.empty((2048 // 128, seq_len * 8), device=hidden_states.device, dtype=torch.float32)
-    # gemm2_output = torch.zeros((seq_len, 7168), device=hidden_states.device, dtype=torch.float32)
+    ws = _get_fused_moe_workspace(hidden_states.device)
+    output = ws.output[:seq_len]
+    output.zero_()
+    stream = ws.stream
+    
     # print("\n*************** fused start *****************")
     # 1~3. routing + fused permute + copy
-    offset, permute_token_idx, permute_weight, permute_hidden_states, permute_hidden_states_scale = my_lib.fusedRoutePermuteCopyWrapper(
+    my_lib.fusedRoutePermuteCopyIntoWrapper(
         routing_logits,
         routing_bias,
         routed_scaling_factor,
         hidden_states,
         hidden_states_scale,
         local_expert_offset,
+        ws.routing_idx,
+        ws.routing_weights,
+        ws.expert_counts,
+        ws.expert_offsets,
+        ws.total_tokens_device,
+        ws.permute_token_idx,
+        ws.permute_weight,
+        ws.permute_hidden_states,
+        ws.permute_hidden_states_scale,
     )
 
-    gemm2_output = torch.empty((seq_len * 8, 7168), device=hidden_states.device, dtype=torch.float32)
-    output = torch.zeros((seq_len, 7168), device=hidden_states.device, dtype=torch.float32)
     # 4. gemm1 & activation
-    gemm1(
-        permute_hidden_states,
-        permute_hidden_states_scale,
-        offset,
-        seq_len,
+    # gemm1(
+    #     permute_hidden_states,
+    #     permute_hidden_states_scale,
+    #     offset,
+    #     seq_len,
+    #     gemm1_weights,
+    #     gemm1_weights_scale,
+    #     gemm1_output,
+    #     gemm1_output_scale,
+    #     num_sm=num_sm,
+    # )
+    gemm1_aot(
+        ws.permute_hidden_states,
+        ws.permute_hidden_states_scale,
+        ws.expert_offsets,
         gemm1_weights,
         gemm1_weights_scale,
-        gemm1_output,
-        gemm1_output_scale,
-        num_sm=num_sm,
+        seq_len,
+        ws.gemm1_output,
+        ws.gemm1_output_scale,
+        stream,
     )
     
     # 5. gemm2 & output
-    gemm2(
-        gemm1_output,
-        gemm1_output_scale,
-        offset,
+    # gemm2(
+    #     gemm1_output,
+    #     gemm1_output_scale,
+    #     offset,
+    #     gemm2_weights,
+    #     gemm2_weights_scale,
+    #     permute_weight,
+    #     permute_token_idx,
+    #     seq_len,
+    #     output=gemm2_output,
+    #     num_sm=num_sm,
+    # )
+    gemm2_aot(
+        ws.gemm1_output,
+        ws.gemm1_output_scale,
+        ws.expert_offsets,
         gemm2_weights,
         gemm2_weights_scale,
-        permute_weight,
-        permute_token_idx,
+        ws.permute_weight,
+        ws.permute_token_idx,
         seq_len,
-        output=gemm2_output,
-        num_sm=num_sm,
+        ws.gemm2_output,
+        stream,
     )
 
     my_lib.scatterAddWrapper(
-        gemm2_output,
-        permute_token_idx,
-        output,
-        offset,
+        ws.gemm2_output,
+        ws.permute_token_idx,
+        ws.output,
+        ws.expert_offsets,
         seq_len
     )
 
