@@ -1110,6 +1110,7 @@ void launchCountExpertAndOffsetsKernel(
     int seq_len,
     int local_expert_offset
 ) {
+    cudaMemsetAsync(expert_counts, 0, 32 * sizeof(int));
     constexpr int threads_per_block = 256;
     const int num_blocks = (seq_len + threads_per_block - 1) / threads_per_block;
     countExpertKernel<<<num_blocks, threads_per_block>>>(
@@ -1207,6 +1208,9 @@ void launchScatterAddKernel(
     void* offset,
     int seq_len
 ) {
+    size_t zero_size = seq_len * 7168 * sizeof(float);
+    cudaMemsetAsync(output, 0, zero_size);
+
     constexpr int threads_per_block = 256;
     const int num_blocks = seq_len * 8;
     scatter_add_kernel<<<num_blocks, threads_per_block>>>(
@@ -1276,290 +1280,6 @@ void launchScatterAddKernel(
     int seq_len
 );
 
-
-std::tuple<torch::Tensor, torch::Tensor> fusedGatingWrapper(
-    torch::Tensor routing_logits, 
-    torch::Tensor routing_bias, 
-    float routing_scaling_factor
-) {
-    auto routing_idx = torch::empty(
-        {routing_logits.size(0), 8},
-        torch::dtype(torch::kInt32).device(routing_logits.device())
-    );
-    auto routing_weights = torch::empty(
-        {routing_logits.size(0), 8},
-        torch::dtype(torch::kFloat32).device(routing_logits.device())
-    );
-
-    
-    launchFusedGatingKernel(
-        routing_logits.data_ptr<float>(),
-        routing_bias.data_ptr<at::BFloat16>(),
-        routing_scaling_factor,
-        routing_idx.data_ptr<int>(),
-        routing_weights.data_ptr<float>(),
-        routing_logits.size(0)
-    );
-
-    return std::make_tuple(routing_idx, routing_weights);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> countExpertAndOffsetsWrapper(
-    torch::Tensor routing_idx,
-    int64_t local_expert_offset
-) {
-    CHECK_CUDA(routing_idx);
-    CHECK_CONTIGUOUS(routing_idx);
-    CHECK_INT32(routing_idx);
-    TORCH_CHECK(routing_idx.dim() == 2, "routing_idx must be [seq_len, 8]");
-    TORCH_CHECK(routing_idx.size(1) == 8, "routing_idx second dim must be 8");
-
-    auto expert_counts = torch::zeros(
-        {32},
-        torch::dtype(torch::kInt32).device(routing_idx.device())
-    );
-    auto expert_offsets = torch::empty(
-        {33},
-        torch::dtype(torch::kInt32).device(routing_idx.device())
-    );
-    auto total_tokens_device = torch::empty(
-        {1},
-        torch::dtype(torch::kInt32).device(routing_idx.device())
-    );
-
-    launchCountExpertAndOffsetsKernel(
-        routing_idx.data_ptr<int>(),
-        expert_counts.data_ptr<int>(),
-        expert_offsets.data_ptr<int>(),
-        total_tokens_device.data_ptr<int>(),
-        static_cast<int>(routing_idx.size(0)),
-        static_cast<int>(local_expert_offset)
-    );
-
-    // const int64_t total_tokens = static_cast<int64_t>(
-    //     total_tokens_device.cpu().item<int>()
-    // );
-
-    return std::make_tuple(expert_counts, expert_offsets);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> permuteWrapper(
-    torch::Tensor routing_idx,
-    torch::Tensor routing_weight,
-    torch::Tensor expert_offsets,
-    int64_t total_tokens,
-    int64_t local_expert_offset
-) {
-    CHECK_CUDA(routing_idx);
-    CHECK_CUDA(routing_weight);
-    CHECK_CUDA(expert_offsets);
-    CHECK_CONTIGUOUS(routing_idx);
-    CHECK_CONTIGUOUS(routing_weight);
-    CHECK_CONTIGUOUS(expert_offsets);
-    CHECK_INT32(routing_idx);
-    CHECK_FLOAT32(routing_weight);
-    CHECK_INT32(expert_offsets);
-
-    TORCH_CHECK(routing_idx.dim() == 2, "routing_idx must be [seq_len, 8]");
-    TORCH_CHECK(routing_weight.dim() == 2, "routing_weight must be [seq_len, 8]");
-    TORCH_CHECK(routing_idx.size(0) == routing_weight.size(0), "routing_idx and routing_weight seq_len must match");
-    TORCH_CHECK(routing_idx.size(1) == 8 && routing_weight.size(1) == 8, "routing_idx/routing_weight second dim must be 8");
-    TORCH_CHECK(expert_offsets.numel() == 32, "expert_offsets must have 32 elements");
-    TORCH_CHECK(total_tokens >= 0, "total_tokens must be non-negative");
-
-    auto out_token_idx = torch::empty(
-        {total_tokens},
-        torch::dtype(torch::kInt32).device(routing_idx.device())
-    );
-    auto out_weights = torch::empty(
-        {total_tokens},
-        torch::dtype(torch::kFloat32).device(routing_idx.device())
-    );
-
-    launchPermuteKernel(
-        routing_idx.data_ptr<int>(),
-        routing_weight.data_ptr<float>(),
-        expert_offsets.data_ptr<int>(),
-        out_token_idx.data_ptr<int>(),
-        out_weights.data_ptr<float>(),
-        static_cast<int>(routing_idx.size(0)),
-        static_cast<int>(local_expert_offset)
-    );
-
-    return std::make_tuple(out_token_idx, out_weights);
-}
-
-std::tuple<torch::Tensor, torch::Tensor> moePermuteCopyFp8WithScaleWrapper(
-    torch::Tensor input,
-    torch::Tensor input_scale,
-    torch::Tensor permuted_token_idx,
-    torch::Tensor offset,
-    torch::Tensor output,
-    torch::Tensor output_scale
-) {
-    CHECK_CUDA(input);
-    CHECK_CUDA(input_scale);
-    CHECK_CUDA(permuted_token_idx);
-    CHECK_CUDA(offset);
-    CHECK_CONTIGUOUS(input);
-    CHECK_CONTIGUOUS(input_scale);
-    CHECK_CONTIGUOUS(permuted_token_idx);
-    CHECK_INT32(permuted_token_idx);
-    CHECK_INT32(offset);
-    CHECK_FLOAT32(input_scale);
-
-    TORCH_CHECK(input.dim() == 2, "input must be [S, 7168]");
-    TORCH_CHECK(input.size(1) == 7168, "input second dim must be 7168");
-    TORCH_CHECK(input.element_size() == 1, "input must be 1-byte dtype for fp8 kernel");
-    TORCH_CHECK(input_scale.dim() == 2, "input_scale must be [56, S]");
-    TORCH_CHECK(input_scale.size(0) == 56, "input_scale first dim must be 56");
-    TORCH_CHECK(input_scale.size(1) == input.size(0), "input_scale second dim must equal input seq len");
-    TORCH_CHECK(permuted_token_idx.dim() == 1, "permuted_token_idx must be [TotalValidTokens]");
-
-    // const auto total_valid_tokens = permuted_token_idx.size(0);
-    // auto output = torch::empty(
-    //     {total_valid_tokens, input.size(1)},
-    //     torch::dtype(input.scalar_type()).device(input.device())
-    // );
-    // auto output_scale = torch::empty(
-    //     {input_scale.size(0), total_valid_tokens},
-    //     torch::dtype(torch::kFloat32).device(input_scale.device())
-    // );
-
-    launchMoePermuteCopyFp8WithScaleKernel(
-        input.data_ptr(),
-        input_scale.data_ptr<float>(),
-        permuted_token_idx.data_ptr<int>(),
-        output.data_ptr(),
-        output_scale.data_ptr<float>(),
-        offset.data_ptr<int>(),
-        static_cast<int>(input.size(0))
-    );
-
-    return std::make_tuple(output, output_scale);
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> fusedRoutePermuteCopyWrapper(
-    torch::Tensor routing_logits,
-    torch::Tensor routing_bias,
-    float routing_scaling_factor,
-    torch::Tensor hidden_states,
-    torch::Tensor hidden_states_scale,
-    int64_t local_expert_offset
-) {
-    CHECK_CUDA(routing_logits);
-    CHECK_CUDA(routing_bias);
-    CHECK_CUDA(hidden_states);
-    CHECK_CUDA(hidden_states_scale);
-    CHECK_CONTIGUOUS(routing_logits);
-    CHECK_CONTIGUOUS(routing_bias);
-    CHECK_CONTIGUOUS(hidden_states);
-    CHECK_CONTIGUOUS(hidden_states_scale);
-    CHECK_FLOAT32(routing_logits);
-    CHECK_FLOAT32(hidden_states_scale);
-
-    TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be [seq_len, 256]");
-    TORCH_CHECK(routing_logits.size(1) == 256, "routing_logits second dim must be 256");
-    TORCH_CHECK(routing_bias.numel() == 256, "routing_bias must have 256 elements");
-    TORCH_CHECK(hidden_states.dim() == 2, "hidden_states must be [seq_len, 7168]");
-    TORCH_CHECK(hidden_states.size(1) == 7168, "hidden_states second dim must be 7168");
-    TORCH_CHECK(hidden_states.element_size() == 1, "hidden_states must be 1-byte dtype for fp8 kernel");
-    TORCH_CHECK(hidden_states_scale.dim() == 2, "hidden_states_scale must be [56, seq_len]");
-    TORCH_CHECK(hidden_states_scale.size(0) == 56, "hidden_states_scale first dim must be 56");
-    TORCH_CHECK(hidden_states_scale.size(1) == hidden_states.size(0), "hidden_states_scale second dim must equal hidden_states seq_len");
-    TORCH_CHECK(routing_logits.size(0) == hidden_states.size(0), "routing_logits and hidden_states seq_len must match");
-
-    const auto seq_len = static_cast<int>(routing_logits.size(0));
-
-    auto routing_idx = torch::empty(
-        {routing_logits.size(0), 8},
-        torch::dtype(torch::kInt32).device(routing_logits.device())
-    );
-    auto routing_weights = torch::empty(
-        {routing_logits.size(0), 8},
-        torch::dtype(torch::kFloat32).device(routing_logits.device())
-    );
-
-    auto expert_counts = torch::zeros(
-        {32},
-        torch::dtype(torch::kInt32).device(routing_logits.device())
-    );
-    auto expert_offsets = torch::empty(
-        {33},
-        torch::dtype(torch::kInt32).device(routing_logits.device())
-    );
-    auto total_tokens_device = torch::empty(
-        {1},
-        torch::dtype(torch::kInt32).device(routing_logits.device())
-    );
-
-    const int64_t total_tokens = static_cast<int64_t>(seq_len) * 8;
-    auto permute_token_idx = torch::empty(
-        {total_tokens},
-        torch::dtype(torch::kInt32).device(routing_idx.device())
-    );
-    auto permute_weight = torch::empty(
-        {total_tokens},
-        torch::dtype(torch::kFloat32).device(routing_idx.device())
-    );
-
-    auto permute_hidden_states = torch::empty(
-        {total_tokens, hidden_states.size(1)},
-        torch::dtype(hidden_states.scalar_type()).device(hidden_states.device())
-    );
-    auto permute_hidden_states_scale = torch::empty(
-        {hidden_states_scale.size(0), total_tokens},
-        torch::dtype(torch::kFloat32).device(hidden_states_scale.device())
-    );
-
-    launchFusedGatingKernel(
-        routing_logits.data_ptr<float>(),
-        routing_bias.data_ptr<at::BFloat16>(),
-        routing_scaling_factor,
-        routing_idx.data_ptr<int>(),
-        routing_weights.data_ptr<float>(),
-        seq_len
-    );
-
-    launchCountExpertAndOffsetsKernel(
-        routing_idx.data_ptr<int>(),
-        expert_counts.data_ptr<int>(),
-        expert_offsets.data_ptr<int>(),
-        total_tokens_device.data_ptr<int>(),
-        seq_len,
-        static_cast<int>(local_expert_offset)
-    );
-
-    launchPermuteKernel(
-        routing_idx.data_ptr<int>(),
-        routing_weights.data_ptr<float>(),
-        expert_counts.data_ptr<int>(),
-        permute_token_idx.data_ptr<int>(),
-        permute_weight.data_ptr<float>(),
-        seq_len,
-        static_cast<int>(local_expert_offset)
-    );
-
-    launchMoePermuteCopyFp8WithScaleKernel(
-        hidden_states.data_ptr(),
-        hidden_states_scale.data_ptr<float>(),
-        permute_token_idx.data_ptr<int>(),
-        permute_hidden_states.data_ptr(),
-        permute_hidden_states_scale.data_ptr<float>(),
-        expert_offsets.data_ptr<int>(),
-        seq_len
-    );
-
-    return std::make_tuple(
-        expert_offsets,
-        permute_token_idx,
-        permute_weight,
-        permute_hidden_states,
-        permute_hidden_states_scale
-    );
-}
-
-
 void fusedRoutePermuteCopyIntoWrapper(
     torch::Tensor routing_logits,
     torch::Tensor routing_bias,
@@ -1575,7 +1295,8 @@ void fusedRoutePermuteCopyIntoWrapper(
     torch::Tensor permute_token_idx,
     torch::Tensor permute_weight,
     torch::Tensor permute_hidden_states,
-    torch::Tensor permute_hidden_states_scale
+    torch::Tensor permute_hidden_states_scale,
+    int seq_len
 ) {
     CHECK_CUDA(routing_logits);
     CHECK_CUDA(routing_bias);
@@ -1627,10 +1348,6 @@ void fusedRoutePermuteCopyIntoWrapper(
     TORCH_CHECK(hidden_states_scale.size(1) == hidden_states.size(0), "hidden_states_scale second dim must equal hidden_states seq_len");
     TORCH_CHECK(routing_logits.size(0) == hidden_states.size(0), "routing_logits and hidden_states seq_len must match");
 
-    const auto seq_len = static_cast<int64_t>(routing_logits.size(0));
-    const auto total_tokens = seq_len * 8;
-
-    expert_counts.zero_();
 
     launchFusedGatingKernel(
         routing_logits.data_ptr<float>(),
@@ -1981,8 +1698,6 @@ def fused_moe(
 ):
     seq_len = hidden_states.size(0)
     ws = _get_fused_moe_workspace(hidden_states.device)
-    output = ws.output[:seq_len]
-    output.zero_()
     stream = ws.stream
     
     # print("\n*************** fused start *****************")
@@ -2003,6 +1718,7 @@ def fused_moe(
         ws.permute_weight,
         ws.permute_hidden_states,
         ws.permute_hidden_states_scale,
+        seq_len
     )
 
     # 4. gemm1 & activation
@@ -2064,7 +1780,7 @@ def fused_moe(
     )
 
     # print("*************** fused over *****************\n")
-    return output.to(torch.bfloat16)
+    return ws.output[:seq_len].to(torch.bfloat16)
 
 def compute_error_stats(
     output: torch.Tensor, reference: torch.Tensor, cfg
@@ -2135,7 +1851,7 @@ def compute_error_stats(
 # test_time(fused_moe, routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, local_expert_offset, routed_scaling_factor)
 # test_time(run, routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, local_expert_offset, routed_scaling_factor)
 
-# # time.sleep(0.5)
+# time.sleep(0.5)
 
 # fused_output = fused_moe(
 #     routing_logits,
