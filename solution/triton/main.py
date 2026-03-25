@@ -1070,6 +1070,68 @@ __global__ void permuteKernel(
     }
 }
 
+__global__ void countScanPermuteKernel(
+    const int* __restrict__ routing_idx,      // [seq_len, 8]
+    const float* __restrict__ routing_weight, // [seq_len, 8]
+    int* __restrict__ expert_counts,          // [32] (kept as prefix offsets for compatibility)
+    int* __restrict__ expert_offsets,         // [33]
+    int* __restrict__ total_tokens,           // [1]
+    int* __restrict__ out_token_idx,          // [total_tokens]
+    float* __restrict__ out_weights,          // [total_tokens]
+    int seq_len,
+    int local_expert_offset
+) {
+    __shared__ int smem_counts[32];
+    __shared__ int smem_cursors[32];
+
+    const int tid = threadIdx.x;
+    if (tid < 32) {
+        smem_counts[tid] = 0;
+    }
+    __syncthreads();
+
+    // Pass-1: count local expert tokens.
+    for (int idx = tid; idx < seq_len; idx += blockDim.x) {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int e_id = routing_idx[idx * 8 + k];
+            if (e_id >= local_expert_offset && e_id < local_expert_offset + 32) {
+                atomicAdd(&smem_counts[e_id - local_expert_offset], 1);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Build exclusive offsets and initialize per-expert cursors.
+    if (tid == 0) {
+        int prefix = 0;
+        #pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            expert_offsets[i] = prefix;
+            expert_counts[i] = prefix;
+            smem_cursors[i] = prefix;
+            prefix += smem_counts[i];
+        }
+        expert_offsets[32] = prefix;
+        total_tokens[0] = prefix;
+    }
+    __syncthreads();
+
+    // Pass-2: permute into compact buffers.
+    for (int idx = tid; idx < seq_len; idx += blockDim.x) {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int e_id = routing_idx[idx * 8 + k];
+            if (e_id >= local_expert_offset && e_id < local_expert_offset + 32) {
+                const int rel_id = e_id - local_expert_offset;
+                const int write_pos = atomicAdd(&smem_cursors[rel_id], 1);
+                out_token_idx[write_pos] = idx;
+                out_weights[write_pos] = routing_weight[idx * 8 + k];
+            }
+        }
+    }
+}
+
 
 __global__ void moe_permute_copy_fp8_with_scale_kernel(
     const __nv_fp8_e4m3* __restrict__ input,        // [S, 7168]
@@ -1149,6 +1211,30 @@ void launchPermuteKernel(
     );
 }
 
+void launchCountScanPermuteKernel(
+    void* routing_idx,
+    void* routing_weight,
+    void* expert_counts,
+    void* expert_offsets,
+    void* total_tokens,
+    void* out_token_idx,
+    void* out_weights,
+    int seq_len,
+    int local_expert_offset
+) {
+    constexpr int threads_per_block = 256;
+    countScanPermuteKernel<<<1, threads_per_block>>>(
+        static_cast<const int*>(routing_idx),
+        static_cast<const float*>(routing_weight),
+        static_cast<int*>(expert_counts),
+        static_cast<int*>(expert_offsets),
+        static_cast<int*>(total_tokens),
+        static_cast<int*>(out_token_idx),
+        static_cast<float*>(out_weights),
+        seq_len,
+        local_expert_offset
+    );
+}
 
 void launchMoePermuteCopyFp8WithScaleKernel(
     void* input,
@@ -1261,6 +1347,18 @@ void launchPermuteKernel(
     int local_expert_offset
 );
 
+void launchCountScanPermuteKernel(
+    void* routing_idx,
+    void* routing_weight,
+    void* expert_counts,
+    void* expert_offsets,
+    void* total_tokens,
+    void* out_token_idx,
+    void* out_weights,
+    int seq_len,
+    int local_expert_offset
+);
+
 
 void launchMoePermuteCopyFp8WithScaleKernel(
     void* input,
@@ -1358,24 +1456,37 @@ void fusedRoutePermuteCopyIntoWrapper(
         static_cast<int>(seq_len)
     );
 
-    launchCountExpertAndOffsetsKernel(
-        routing_idx.data_ptr<int>(),
-        expert_counts.data_ptr<int>(),
-        expert_offsets.data_ptr<int>(),
-        total_tokens_device.data_ptr<int>(),
-        static_cast<int>(seq_len),
-        static_cast<int>(local_expert_offset)
-    );
-
-    launchPermuteKernel(
+    if (seq_len > 256) {
+        launchCountExpertAndOffsetsKernel(
+            routing_idx.data_ptr<int>(),
+            expert_counts.data_ptr<int>(),
+            expert_offsets.data_ptr<int>(),
+            total_tokens_device.data_ptr<int>(),
+            static_cast<int>(seq_len),
+            static_cast<int>(local_expert_offset)
+        );
+        launchPermuteKernel(
+            routing_idx.data_ptr<int>(),
+            routing_weights.data_ptr<float>(),
+            expert_counts.data_ptr<int>(),
+            permute_token_idx.data_ptr<int>(),
+            permute_weight.data_ptr<float>(),
+            static_cast<int>(seq_len),
+            static_cast<int>(local_expert_offset)
+        );
+    } else {
+        launchCountScanPermuteKernel(
         routing_idx.data_ptr<int>(),
         routing_weights.data_ptr<float>(),
         expert_counts.data_ptr<int>(),
+        expert_offsets.data_ptr<int>(),
+        total_tokens_device.data_ptr<int>(),
         permute_token_idx.data_ptr<int>(),
         permute_weight.data_ptr<float>(),
         static_cast<int>(seq_len),
         static_cast<int>(local_expert_offset)
     );
+    }
 
     launchMoePermuteCopyFp8WithScaleKernel(
         hidden_states.data_ptr(),
