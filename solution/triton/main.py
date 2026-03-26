@@ -332,18 +332,18 @@ class gemm1Kernel:
         if seq_len <= 100:
             kernel = self.kernels[0]
             blk_size = 16
-        elif seq_len <= 500:
+        elif seq_len <= 50000:
             kernel = self.kernels[1]
             blk_size = 32
-        elif seq_len <= 2000:
-            kernel = self.kernels[2]
-            blk_size = 64
-        elif seq_len <= 20000:
-            kernel = self.kernels[3]
-            blk_size = 128
-        else:
-            kernel = self.kernels[4]
-            blk_size = 256
+        # elif seq_len <= 2000:
+        #     kernel = self.kernels[2]
+        #     blk_size = 64
+        # elif seq_len <= 20000:
+        #     kernel = self.kernels[3]
+        #     blk_size = 128
+        # else:
+        #     kernel = self.kernels[4]
+        #     blk_size = 256
 
         grid = (self.num_sm, 1, 1)
         launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, seq_len, c_base, c_scale_base)
