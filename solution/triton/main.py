@@ -38,7 +38,7 @@ def gemm1_kernel(
     b_scale_base_ptr, # [32, 4096//128, 7168//128], fp32
     seq_len,
     # output
-    c_base_ptr, # [sum(s_i), 2048], fp32
+    c_base_ptr, # [sum(s_i), 4096], fp32
     c_scale_base_ptr, # [2048//128, sum(s_i)], fp32
     # other
     NUM_SM: tl.constexpr,
@@ -49,29 +49,30 @@ def gemm1_kernel(
     tile_idx = tl.program_id(0)
     last_gemm_end_tile_idx = 0
 
-    num_valid_tokens = tl.load(a_offset_ptr + 32) # sum(s_i)
+    # num_valid_tokens = tl.load(a_offset_ptr + 32) # sum(s_i)
     # 遍历 gemm
     for i in range(32):
-        gm = tl.load(a_offset_ptr + i + 1) - tl.load(a_offset_ptr + i) # s_i
+        offset = tl.load(a_offset_ptr + i)
+        gm = tl.load(a_offset_ptr + i + 1) - offset # s_i
         gn = 4096
         gk = 7168
         num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
-        num_n_tiles = tl.cdiv(gn // 2, BLOCK_SIZE_N) # 处理两个 tile
+        num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N) # 处理两个 tile
         num_tiles = (num_m_tiles * num_n_tiles).to(tl.int32)
 
         # 检查当前 tile 编号是否还在当前 gemm 范围内
         if tile_idx >= last_gemm_end_tile_idx and tile_idx < last_gemm_end_tile_idx + num_tiles:
             lda = 7168
             ldb = 7168
-            ldc = 2048
+            ldc = 4096
 
-            a_ptr = a_base_ptr + tl.load(a_offset_ptr + i) * lda
+            a_ptr = a_base_ptr + offset * lda
             b_ptr = b_base_ptr + gn * gk * i
-            c_ptr = c_base_ptr + tl.load(a_offset_ptr + i) * ldc
+            c_ptr = c_base_ptr + offset * ldc
 
-            a_scale_ptr = a_scale_base_ptr + tl.load(a_offset_ptr + i)
+            a_scale_ptr = a_scale_base_ptr + offset
             b_scale_ptr = b_scale_base_ptr + gn // 128 * gk // 128 * i
-            c_scale_ptr = c_scale_base_ptr + tl.load(a_offset_ptr + i)
+            # c_scale_ptr = c_scale_base_ptr + tl.load(a_offset_ptr + i)
 
             # TMA
             a_desc = tl.make_tensor_descriptor(
@@ -86,12 +87,12 @@ def gemm1_kernel(
                 strides=[ldb, 1],
                 block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
             )
-            b2_desc = tl.make_tensor_descriptor(
-                b_ptr,
-                shape=[gn, gk],
-                strides=[ldb, 1],
-                block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
-            )
+            # b2_desc = tl.make_tensor_descriptor(
+            #     b_ptr,
+            #     shape=[gn, gk],
+            #     strides=[ldb, 1],
+            #     block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+            # )
             c_desc = tl.make_tensor_descriptor(
                 c_ptr,
                 shape=[gm, gn],
@@ -108,34 +109,40 @@ def gemm1_kernel(
 
                 offs_am = tile_m_idx * BLOCK_SIZE_M
                 offs_bn1 = tile_n_idx * BLOCK_SIZE_N
-                offs_bn2 = (tile_n_idx + num_n_tiles) * BLOCK_SIZE_N
+                # offs_bn2 = (tile_n_idx + num_n_tiles) * BLOCK_SIZE_N
 
                 # 缩放矩阵每一行的元素个数
                 num_k_blocks = tl.cdiv(k, 128)
 
                 acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-                acc2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-                for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
+                # acc2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+                for kk in tl.range(0, tl.cdiv(k, BLOCK_SIZE_K), num_stages=6, warp_specialize=True):
                     a = a_desc.load(
                         [offs_am, kk * BLOCK_SIZE_K],
                     )
                     b1 = b1_desc.load(
                         [offs_bn1, kk * BLOCK_SIZE_K],
                     )
-                    b2 = b2_desc.load(
-                        [offs_bn2, kk * BLOCK_SIZE_K],
-                    )
+                    # b2 = b2_desc.load(
+                    #     [offs_bn2, kk * BLOCK_SIZE_K],
+                    # )
+                    # a_idx = a_ptr + offs_am * lda + kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_M)[:, None] * lda + tl.arange(0, BLOCK_SIZE_K)[None, :]
+                    # b1_idx = b_ptr + offs_bn1 * ldb + kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_N)[:, None] * ldb + tl.arange(0, BLOCK_SIZE_K)[None, :]
+                    # b2_idx = b_ptr + offs_bn2 * ldb + kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_N)[:, None] * ldb + tl.arange(0, BLOCK_SIZE_K)[None, :]
+                    # a = tl.load(a_idx, mask=((offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None]) # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+                    # b1 = tl.load(b1_idx) # [BLOCK_SIZE_N, BLOCK_SIZE_K]
+                    # b2 = tl.load(b2_idx) # [BLOCK_SIZE_N, BLOCK_SIZE_K
                     
                     # 获取当前 128x128 block 的缩放因子
                     a_scale_idx = a_scale_ptr + offs_am + kk * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
                     a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
                     b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
-                    b2_scale = tl.load(b_scale_ptr + (offs_bn2 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
+                    # b2_scale = tl.load(b_scale_ptr + (offs_bn2 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
 
 
                     acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
-                    acc2 += tl.dot(a, b2.T) * a_scale_col * b2_scale
+                    # acc2 += tl.dot(a, b2.T) * a_scale_col * b2_scale
                     # a = a.to(tl.float32) * a_scale_col
                     # b1 = b1.to(tl.float32) * b1_scale
                     # b2 = b2.to(tl.float32) * b2_scale
@@ -144,30 +151,32 @@ def gemm1_kernel(
                     
 
                 # activation
-                silu_x2 = acc2 / (1.0 + tl.exp(-acc2))
-                res_c = silu_x2 * acc1
+                # silu_x2 = acc2 / (1.0 + tl.exp(-acc2))
+                # res_c = silu_x2 * acc1
 
                 # if tile_idx == 0:
                 #     tl.device_print("Partial Block:", res_c, acc1, acc2)
 
                 # 量化
-                abs_c = tl.abs(res_c)
+                # abs_c = tl.abs(res_c)
                 # 在 N 维度上做 reduce，找最大值
                 # max_val 的 shape 为 [BLOCK_SIZE_M]
-                max_val = tl.max(abs_c, axis=1)
-                fp8_max = 448.0
-                tile_scale = max_val / fp8_max
-                res_c = (res_c / tl.reshape(tile_scale, (BLOCK_SIZE_M, 1))).to(tl.float8e4nv)
+                # max_val = tl.max(abs_c, axis=1)
+                # fp8_max = 448.0
+                # tile_scale = max_val / fp8_max
+                # res_c = (res_c / tl.reshape(tile_scale, (BLOCK_SIZE_M, 1))).to(tl.float8e4nv)
 
                 # 写回
                 offs_cm = tile_m_idx * BLOCK_SIZE_M
                 offs_cn = tile_n_idx * BLOCK_SIZE_N
                 c_desc.store(
                     [offs_cm, offs_cn],
-                    res_c,
+                    acc1.to(tl.float16),
                 )
-                c_scale_idx = c_scale_ptr + offs_cm + tile_n_idx * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
-                tl.store(c_scale_idx, tile_scale, mask=(offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)
+                # c_idx = c_ptr + offs_cm * ldc + offs_cn + tl.arange(0, BLOCK_SIZE_M)[:, None] * ldc + tl.arange(0, BLOCK_SIZE_N)[None, :]
+                # tl.store(c_idx, res_c.to(tl.bfloat16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
+                # c_scale_idx = c_scale_ptr + offs_cm + tile_n_idx * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
+                # tl.store(c_scale_idx, tile_scale, mask=(offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)
 
 
                 # 下一个 tile
@@ -264,7 +273,7 @@ class gemm1Kernel:
             'b_base_ptr': '*fp8e4nv',
             'b_scale_base_ptr': '*fp32',
             'seq_len': 'i32',
-            'c_base_ptr': '*fp8e4nv',
+            'c_base_ptr': '*fp16',
             'c_scale_base_ptr': '*fp32',
             'NUM_SM': 'constexpr',
             'BLOCK_SIZE_M': 'constexpr',
@@ -272,14 +281,20 @@ class gemm1Kernel:
             'BLOCK_SIZE_K': 'constexpr'
         }
 
-        blk_sizes = [16, 32, 64, 128, 256]
+        blk_sizes = [64, 128]
+        num_stages = [8, 6]
         constexprs_list = []
-        for blk_size in blk_sizes:
+        options_list = []
+        for i in range(len(blk_sizes)):
             constexprs_list.append({
-                (8,): num_sm,
-                (9,): blk_size,
-                (10,): 128,
+                (8,): num_sm, 
+                (9,): blk_sizes[i], 
+                (10,): 128, 
                 (11,): 128
+            })
+            options_list.append({
+                "num_warps": 8,
+                "num_stages": num_stages[i],
             })
         
         attrs = {
@@ -295,17 +310,14 @@ class gemm1Kernel:
 
         self.num_sm = num_sm
         self.kernels = []
-        for constexprs in constexprs_list:
+        for i in range(len(blk_sizes)):
             src = ASTSource(
                 fn=gemm1_kernel,
                 signature=signature,
-                constexprs=constexprs,
+                constexprs=constexprs_list[i],
                 attrs=attrs
             )
-            compiled_kernel = compile(src, options={
-                "num_warps": 8,
-                "num_stages": 4,
-            })
+            compiled_kernel = compile(src, options=options_list[i])
             # compiled_kernel = compile(src)
             self.kernels.append(compiled_kernel)
 
@@ -329,12 +341,12 @@ class gemm1Kernel:
 
         kernel = None
         blk_size = None
-        if seq_len <= 100:
+        if seq_len <= 1000:
             kernel = self.kernels[0]
-            blk_size = 16
-        elif seq_len <= 50000:
+            blk_size = 64
+        else:
             kernel = self.kernels[1]
-            blk_size = 32
+            blk_size = 128
         # elif seq_len <= 2000:
         #     kernel = self.kernels[2]
         #     blk_size = 64
@@ -344,6 +356,8 @@ class gemm1Kernel:
         # else:
         #     kernel = self.kernels[4]
         #     blk_size = 256
+        # kernel = self.kernels[2]
+        # blk_size = 64
 
         grid = (self.num_sm, 1, 1)
         launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, seq_len, c_base, c_scale_base)
@@ -466,7 +480,7 @@ def gemm2_kernel(
                 # 缩放矩阵每一行的元素个数
                 num_k_blocks = tl.cdiv(k, 128)
                 acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-                for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
+                for kk in tl.range(0, tl.cdiv(k, BLOCK_SIZE_K), num_stages=8, warp_specialize=True):
                     a = a_desc.load(
                         [offs_am, kk * BLOCK_SIZE_K],
                     )
@@ -478,6 +492,7 @@ def gemm2_kernel(
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
                     a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
                     b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
+                    # b1_scale = b_scale[kk:kk+1]
 
                     acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
                     # a = a.to(tl.float32) * a_scale_col
@@ -615,14 +630,20 @@ class gemm2Kernel:
             'BLOCK_SIZE_K': 'constexpr'
         }
 
-        blk_sizes = [16, 32, 64, 128, 256]
+        blk_sizes = [64, 128]
+        num_stages = [6, 4]
         constexprs_list = []
-        for blk_size in blk_sizes:
+        options_list = []
+        for i in range(len(blk_sizes)):
             constexprs_list.append({
                 (9,): num_sm, 
-                (10,): blk_size, 
+                (10,): blk_sizes[i], 
                 (11,): 128, 
                 (12,): 128
+            })
+            options_list.append({
+                "num_warps": 8,
+                "num_stages": num_stages[i],
             })
         
         attrs = {
@@ -639,17 +660,14 @@ class gemm2Kernel:
 
         self.num_sm = num_sm
         self.kernels = []
-        for constexprs in constexprs_list:
+        for i in range(len(blk_sizes)):
             src = ASTSource(
                 fn=gemm2_kernel,
                 signature=signature,
-                constexprs=constexprs,
+                constexprs=constexprs_list[i],
                 attrs=attrs
             )
-            compiled_kernel = compile(src, options={
-                "num_warps": 8,
-                "num_stages": 4,
-            })
+            compiled_kernel = compile(src, options=options_list[i])
             # compiled_kernel = compile(src)
             self.kernels.append(compiled_kernel)
 
@@ -675,21 +693,23 @@ class gemm2Kernel:
 
         kernel = None
         blk_size = None
-        if seq_len <= 100:
+        if seq_len <= 1000:
             kernel = self.kernels[0]
-            blk_size = 16
-        elif seq_len <= 500:
-            kernel = self.kernels[1]
-            blk_size = 32
-        elif seq_len <= 2000:
-            kernel = self.kernels[2]
             blk_size = 64
-        elif seq_len <= 20000:
-            kernel = self.kernels[3]
-            blk_size = 128
         else:
-            kernel = self.kernels[4]
-            blk_size = 256
+            kernel = self.kernels[1]
+            blk_size = 128
+        # elif seq_len <= 2000:
+        #     kernel = self.kernels[2]
+        #     blk_size = 64
+        # elif seq_len <= 20000:
+        #     kernel = self.kernels[3]
+        #     blk_size = 128
+        # else:
+        #     kernel = self.kernels[4]
+        #     blk_size = 256
+        # kernel = self.kernels[2]
+        # blk_size = 64
 
         grid = (self.num_sm, 1, 1)
         launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, permute_weights, permute_token_idx, seq_len, output)
@@ -732,6 +752,7 @@ kernel_src = """
 #include <stdio.h>
 #include <cfloat>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
 #include <device_launch_parameters.h>
@@ -1306,6 +1327,76 @@ void launchScatterAddKernel(
         static_cast<int*>(offset)
     );
 }
+
+__global__ void act_quant_kernel(
+    const __half* __restrict__ input, // [valid, 4096], fp16
+    __nv_fp8_e4m3* __restrict__ output,      // [valid, 2048]
+    float* __restrict__ scale,       // [2048 / 128, valid]
+    int* __restrict__ offset,        // [33]
+    int seq_len
+) {
+    constexpr int HIDDEN = 2048;
+    constexpr int GROUP = 128;
+    constexpr float FP8_E4M3_MAX = 448.0f;
+
+    const int row = blockIdx.x;
+    const int group_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int num_valid = offset[32];
+    if (row >= num_valid || group_idx >= (HIDDEN / GROUP) || tid >= GROUP) {
+        return;
+    }
+
+    const int col = group_idx * GROUP + tid;
+    const int in_row_base = row * (HIDDEN * 2);
+    const int out_row_base = row * HIDDEN;
+
+    // input 被拆成前后两半：input1 和 input2，然后做 input1 * SiLU(input2)。
+    const float x1 = __half2float(input[in_row_base + col]);
+    const float x2 = __half2float(input[in_row_base + HIDDEN + col]);
+    const float silu2 = x2 / (1.0f + expf(-x2));
+    const float res = x1 * silu2;
+
+    __shared__ float smem_abs_max[GROUP];
+    smem_abs_max[tid] = fabsf(res);
+    __syncthreads();
+
+    for (int stride = GROUP / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem_abs_max[tid] = fmaxf(smem_abs_max[tid], smem_abs_max[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float max_abs = smem_abs_max[0];
+    const float group_scale = (max_abs > 0.0f) ? (max_abs / FP8_E4M3_MAX) : 1.0f;
+    if (tid == 0) {
+        scale[group_idx * seq_len * 8 + row] = group_scale;
+    }
+
+    float q = res / group_scale;
+    q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+    output[out_row_base + col] = static_cast<__nv_fp8_e4m3>(q);
+}
+
+void launchActQuantKernel(
+    void* input,
+    void* output,
+    void* scale,
+    void* offset,
+    int seq_len
+) {
+    constexpr int threads_per_block = 128;
+    const dim3 grid_dim(seq_len * 8, 2048 / 128);
+    act_quant_kernel<<<grid_dim, threads_per_block>>>(
+        static_cast<const __half*>(input),
+        static_cast<__nv_fp8_e4m3*>(output),
+        static_cast<float*>(scale),
+        static_cast<int*>(offset),
+        seq_len
+    );
+}
 """
 
 cpp_src = """
@@ -1374,6 +1465,14 @@ void launchScatterAddKernel(
     void* tmp_output,
     void* token_idx,
     void* output,
+    void* offset,
+    int seq_len
+);
+
+void launchActQuantKernel(
+    void* input,
+    void* output,
+    void* scale,
     void* offset,
     int seq_len
 );
@@ -1533,6 +1632,22 @@ void scatterAddWrapper(
         seq_len
     );
 }
+
+void actQuantWrapper(
+    torch::Tensor input,
+    torch::Tensor output,
+    torch::Tensor scale,
+    torch::Tensor offset,
+    int seq_len
+) {
+    launchActQuantKernel(
+        input.data_ptr(),
+        output.data_ptr(),
+        scale.data_ptr(),
+        offset.data_ptr(),
+        seq_len
+    );
+}
 """
 
 
@@ -1540,7 +1655,7 @@ my_lib = load_inline(
     name = "fused_gating",
     cuda_sources=kernel_src,
     cpp_sources=cpp_src,
-    functions=["fusedRoutePermuteCopyIntoWrapper", "scatterAddWrapper"],
+    functions=["fusedRoutePermuteCopyIntoWrapper", "scatterAddWrapper", "actQuantWrapper"],
     verbose=True
 )
 
@@ -1775,8 +1890,9 @@ class FusedMoeWorkspace:
         self.permute_hidden_states_scale = torch.empty((56, total_tokens), device=device, dtype=torch.float32)
 
         # gemm / reduce outputs
-        self.gemm1_output = torch.empty((total_tokens, 2048), device=device, dtype=torch.float8_e4m3fn)
-        self.gemm1_output_scale = torch.empty((2048 // 128, total_tokens), device=device, dtype=torch.float32)
+        self.gemm1_output = torch.empty((total_tokens, 2048), device=device, dtype=torch.float16)
+        self.gemm2_input = torch.empty((total_tokens, 2048), device=device, dtype=torch.float8_e4m3fn)
+        self.gemm2_input_scale = torch.empty((2048 // 128, total_tokens), device=device, dtype=torch.float32)
         self.gemm2_output = torch.empty((total_tokens, 7168), device=device, dtype=torch.float32)
         self.output = torch.empty((seq_len, 7168), device=device, dtype=torch.float32)
 
@@ -1852,8 +1968,15 @@ def fused_moe(
         gemm1_weights_scale,
         seq_len,
         ws.gemm1_output,
-        ws.gemm1_output_scale,
+        ws.gemm2_input_scale,
         stream,
+    )
+    my_lib.actQuantWrapper(
+        ws.gemm1_output,
+        ws.gemm2_input,
+        ws.gemm2_input_scale,
+        ws.expert_offsets,
+        seq_len,
     )
     
     # 5. gemm2 & output
@@ -1870,8 +1993,8 @@ def fused_moe(
     #     num_sm=num_sm,
     # )
     gemm2_aot(
-        ws.gemm1_output,
-        ws.gemm1_output_scale,
+        ws.gemm2_input,
+        ws.gemm2_input_scale,
         ws.expert_offsets,
         gemm2_weights,
         gemm2_weights_scale,
@@ -1922,13 +2045,47 @@ def compute_error_stats(
 
     return max_abs, max_rel, exceeds_tol, matched_ratio
 
+import json
+WORKLOAD_PATH = "/root/mlsys26-contest"
+def read_workload(
+    file_path=f"{WORKLOAD_PATH}/workloads/moe/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.jsonl",
+    idx=0,
+):
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            item = json.loads(line.strip())
+            data.append(item)
+    workload = data[idx]["workload"]
+    seq_len = workload["axes"]["seq_len"]
+    routing_logits_file = WORKLOAD_PATH + workload["inputs"]["routing_logits"]["path"][1:]
+    routing_bias_file = WORKLOAD_PATH + workload["inputs"]["routing_bias"]["path"][1:]
+    local_expert_offset = workload["inputs"]["local_expert_offset"]["value"]
+
+    def read_safetensors(file_path, key):
+        from safetensors import safe_open
+        with safe_open(file_path, framework="pt", device='cuda') as f:
+            tensor = f.get_tensor(key)
+        return tensor
+    
+    routing_logits = read_safetensors(routing_logits_file, "routing_logits")
+    routing_bias = read_safetensors(routing_bias_file, "routing_bias")
+    print(f"test seq_len: {seq_len}")
+
+    
+    return seq_len, routing_logits, routing_bias, local_expert_offset
+
+# workload_idx = 17
+# seq_len, routing_logits, routing_bias, local_expert_offset = read_workload(idx=workload_idx)
+
 # print("========== test ==========")
 # torch.manual_seed(42)
-# torch.set_default_device('cuda:0')
+# torch.set_default_device('cuda')
+# torch.cuda.set_device(0)
 
-# seq_len = 901 
+# # seq_len = 32  # 示例序列长度
 # num_experts = 256
-# num_local_experts = 32
+# num_local_experts = 32  # 假设当前 Rank 负责的专家数
 # hidden_size = 7168
 # intermediate_size = 2048
 # gemm1_out_size = 4096
@@ -1939,8 +2096,8 @@ def compute_error_stats(
 # num_gemm1_out_blocks = gemm1_out_size // block_size
 
 
-# routing_logits = torch.randn(seq_len, num_experts, dtype=torch.float32)
-# routing_bias = torch.randn(num_experts, dtype=torch.bfloat16)
+# # routing_logits = torch.randn(seq_len, num_experts, dtype=torch.float32)
+# # routing_bias = torch.randn(num_experts, dtype=torch.bfloat16)
 # hidden_states = torch.randn(seq_len, hidden_size).to(torch.float8_e4m3fn)
 # hidden_states_scale = torch.randn(num_hidden_blocks, seq_len, dtype=torch.float32)
 # gemm1_weights = torch.randn(
@@ -1955,12 +2112,17 @@ def compute_error_stats(
 # gemm2_weights_scale = torch.randn(
 #     num_local_experts, num_hidden_blocks, num_intermediate_blocks, dtype=torch.float32
 # )
-# local_expert_offset = 32
+# # local_expert_offset = 32
 # routed_scaling_factor = 1.11
 
 
+# # with profile(
+# #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+# #     with_stack=True,
+# #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'),
+# # ) as prof:
 # test_time(fused_moe, routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, local_expert_offset, routed_scaling_factor)
-# test_time(run, routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, local_expert_offset, routed_scaling_factor)
+# # test_time(run, routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, local_expert_offset, routed_scaling_factor)
 
 # time.sleep(0.5)
 
@@ -1977,7 +2139,6 @@ def compute_error_stats(
 #     routed_scaling_factor
 # )
 
-
 # std_output = run(
 #     routing_logits,
 #     routing_bias,
@@ -1990,6 +2151,7 @@ def compute_error_stats(
 #     local_expert_offset,
 #     routed_scaling_factor
 # )
+
 
 # max_abs, max_rel, exceeds_tol, matched_ratio = compute_error_stats(
 #     fused_output,
