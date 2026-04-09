@@ -7,13 +7,21 @@ import torch.utils.cpp_extension
 import triton
 import triton.language as tl
 from typing import List, Sequence
+from dataclasses import dataclass
 
 
+#################################################################################
+#################################################################################
+#################################################################################
+#################################################################################
+@dataclass
+class GemmConfig:
+    block_size_m: int
+    block_size_n: int
+    block_size_k: int
+    num_stages: int
 
-#################################################################################
-#################################################################################
-#################################################################################
-#################################################################################
+
 def get_blk_size_m(args):
     if args["seq_len"] <= 100:
         return 16
@@ -491,14 +499,18 @@ def gemm2_kernel(
                     a_scale_idx = a_scale_ptr + offs_am + kk * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
                     a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
-                    b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
-                    # b1_scale = b_scale[kk:kk+1]
-
-                    acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
-                    # a = a.to(tl.float32) * a_scale_col
-                    # b1 = b1.to(tl.float32) * b1_scale
-                    # acc1 += tl.dot(a, b1.T, input_precision="ieee")
-                    # acc1 += tl.dot(a, b1.T)
+                    if BLOCK_SIZE_N == 128:
+                        b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
+                        acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
+                    else:
+                        b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
+                        b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
+                        b1_scale2 = tl.load(b_scale_ptr + ((offs_bn1 + 128) // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
+                        scales = tl.join(b1_scale, b1_scale2)
+                        b_scale_vec = tl.reshape(scales, (2, 1))
+                        scales_expanded = tl.broadcast_to(b_scale_vec, (2, 128))
+                        final_scales = tl.reshape(scales_expanded, (1, 256))
+                        acc1 += tl.dot(a, b1.T) * a_scale_col * final_scales
 
                 # 和 weight 相乘
                 offs_m = offs_am + tl.arange(0, BLOCK_SIZE_M)
@@ -630,20 +642,21 @@ class gemm2Kernel:
             'BLOCK_SIZE_K': 'constexpr'
         }
 
-        blk_sizes = [64, 128]
-        num_stages = [6, 4]
+        self.configs = []
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4))
+        self.configs.append(GemmConfig(block_size_m=128, block_size_n=128, block_size_k=128, num_stages=4))
         constexprs_list = []
         options_list = []
-        for i in range(len(blk_sizes)):
+        for i in range(len(self.configs)):
             constexprs_list.append({
                 (9,): num_sm, 
-                (10,): blk_sizes[i], 
-                (11,): 128, 
-                (12,): 128
+                (10,): self.configs[i].block_size_m, 
+                (11,): self.configs[i].block_size_n, 
+                (12,): self.configs[i].block_size_k
             })
             options_list.append({
                 "num_warps": 8,
-                "num_stages": num_stages[i],
+                "num_stages": self.configs[i].num_stages,
             })
         
         attrs = {
@@ -660,7 +673,7 @@ class gemm2Kernel:
 
         self.num_sm = num_sm
         self.kernels = []
-        for i in range(len(blk_sizes)):
+        for i in range(len(self.configs)):
             src = ASTSource(
                 fn=gemm2_kernel,
                 signature=signature,
@@ -692,24 +705,13 @@ class gemm2Kernel:
             stream = stream.cuda_stream
 
         kernel = None
-        blk_size = None
+        config = None
         if seq_len <= 1000:
             kernel = self.kernels[0]
-            blk_size = 64
+            config = self.configs[0]
         else:
             kernel = self.kernels[1]
-            blk_size = 128
-        # elif seq_len <= 2000:
-        #     kernel = self.kernels[2]
-        #     blk_size = 64
-        # elif seq_len <= 20000:
-        #     kernel = self.kernels[3]
-        #     blk_size = 128
-        # else:
-        #     kernel = self.kernels[4]
-        #     blk_size = 256
-        # kernel = self.kernels[2]
-        # blk_size = 64
+            config = self.configs[1]
 
         grid = (self.num_sm, 1, 1)
         launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, permute_weights, permute_token_idx, seq_len, output)
@@ -732,9 +734,9 @@ class gemm2Kernel:
             seq_len,
             output,
             self.num_sm,
-            blk_size,
-            128,
-            128,
+            config.block_size_m,
+            config.block_size_n,
+            config.block_size_k,
         )
         return
 
