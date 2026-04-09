@@ -145,11 +145,19 @@ def gemm1_kernel(
                     a_scale_idx = a_scale_ptr + offs_am + kk * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
                     a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
-                    b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
-                    # b2_scale = tl.load(b_scale_ptr + (offs_bn2 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
-
-
-                    acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
+                    # b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
+                    # acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
+                    if BLOCK_SIZE_N == 128:
+                        b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
+                        acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
+                    else:
+                        b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
+                        b1_scale2 = tl.load(b_scale_ptr + ((offs_bn1 + 128) // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
+                        scales = tl.join(b1_scale, b1_scale2)
+                        b_scale_vec = tl.reshape(scales, (2, 1))
+                        scales_expanded = tl.broadcast_to(b_scale_vec, (2, 128))
+                        final_scales = tl.reshape(scales_expanded, (1, 256))
+                        acc1 += tl.dot(a, b1.T) * a_scale_col * final_scales
                     # acc2 += tl.dot(a, b2.T) * a_scale_col * b2_scale
                     # a = a.to(tl.float32) * a_scale_col
                     # b1 = b1.to(tl.float32) * b1_scale
@@ -289,20 +297,24 @@ class gemm1Kernel:
             'BLOCK_SIZE_K': 'constexpr'
         }
 
-        blk_sizes = [64, 128]
-        num_stages = [8, 6]
+        # blk_sizes = [64, 128]
+        # num_stages = [8, 6]
+        self.configs = []
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=128, block_size_k=128, num_stages=8))
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4))
+        self.configs.append(GemmConfig(block_size_m=128, block_size_n=128, block_size_k=128, num_stages=6))
         constexprs_list = []
         options_list = []
-        for i in range(len(blk_sizes)):
+        for i in range(len(self.configs)):
             constexprs_list.append({
                 (8,): num_sm, 
-                (9,): blk_sizes[i], 
-                (10,): 128, 
-                (11,): 128
+                (9,): self.configs[i].block_size_m, 
+                (10,): self.configs[i].block_size_n, 
+                (11,): self.configs[i].block_size_k
             })
             options_list.append({
                 "num_warps": 8,
-                "num_stages": num_stages[i],
+                "num_stages": self.configs[i].num_stages,
             })
         
         attrs = {
@@ -318,7 +330,7 @@ class gemm1Kernel:
 
         self.num_sm = num_sm
         self.kernels = []
-        for i in range(len(blk_sizes)):
+        for i in range(len(self.configs)):
             src = ASTSource(
                 fn=gemm1_kernel,
                 signature=signature,
@@ -348,24 +360,16 @@ class gemm1Kernel:
             stream = stream.cuda_stream
 
         kernel = None
-        blk_size = None
-        if seq_len <= 1000:
+        config = None
+        if seq_len <= 4:
             kernel = self.kernels[0]
-            blk_size = 64
-        else:
+            config = self.configs[0]
+        elif seq_len <= 1000:
             kernel = self.kernels[1]
-            blk_size = 128
-        # elif seq_len <= 2000:
-        #     kernel = self.kernels[2]
-        #     blk_size = 64
-        # elif seq_len <= 20000:
-        #     kernel = self.kernels[3]
-        #     blk_size = 128
-        # else:
-        #     kernel = self.kernels[4]
-        #     blk_size = 256
-        # kernel = self.kernels[2]
-        # blk_size = 64
+            config = self.configs[1]
+        else:
+            kernel = self.kernels[2]
+            config = self.configs[2]
 
         grid = (self.num_sm, 1, 1)
         launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, seq_len, c_base, c_scale_base)
@@ -387,9 +391,9 @@ class gemm1Kernel:
             c_base,
             c_scale_base,
             self.num_sm,
-            blk_size,
-            128,
-            128,
+            config.block_size_m,
+            config.block_size_n,
+            config.block_size_k,
         )
         return
 
@@ -503,7 +507,6 @@ def gemm2_kernel(
                         b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
                         acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
                     else:
-                        b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
                         b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
                         b1_scale2 = tl.load(b_scale_ptr + ((offs_bn1 + 128) // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
                         scales = tl.join(b1_scale, b1_scale2)
@@ -2077,7 +2080,7 @@ def read_workload(
     
     return seq_len, routing_logits, routing_bias, local_expert_offset
 
-# workload_idx = 17
+# workload_idx = 8
 # seq_len, routing_logits, routing_bias, local_expert_offset = read_workload(idx=workload_idx)
 
 # print("========== test ==========")
