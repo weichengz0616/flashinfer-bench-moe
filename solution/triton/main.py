@@ -538,7 +538,7 @@ def gemm2_kernel(
                 offs_cn = tile_n_idx * BLOCK_SIZE_N
                 c_desc.store(
                     [offs_cm, offs_cn],
-                    acc1,
+                    acc1.to(tl.bfloat16),
                 )
 
                 # 下一个 tile
@@ -638,7 +638,7 @@ class gemm2Kernel:
             'permute_weights_base_ptr': '*fp32',
             'permute_token_idx_base_ptr': '*i32',
             'seq_len': 'i32',
-            'output_ptr': '*fp32',
+            'output_ptr': '*bf16',
             'NUM_SM': 'constexpr',
             'BLOCK_SIZE_M': 'constexpr',
             'BLOCK_SIZE_N': 'constexpr',
@@ -1073,6 +1073,8 @@ __global__ void permuteKernel(
     int* __restrict__ expert_offsets,       // [32] - 传入前已做过 cumsum
     int* __restrict__ out_token_idx,        // [total_tokens]
     float* __restrict__ out_weights,        // [total_tokens]
+    int* __restrict__ token2permuted_idx,     // [seq_len * 8]
+    int* __restrict__ token_counts,
     int seq_len,
     int local_expert_offset
 ) {
@@ -1080,6 +1082,7 @@ __global__ void permuteKernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= seq_len) return;
 
+    int expert_cnt = 0;
     for (int k = 0; k < 8; ++k) {
         int e_id = routing_idx[idx * 8 + k];
         if (e_id >= local_expert_offset && e_id < local_expert_offset + 32) {
@@ -1092,8 +1095,12 @@ __global__ void permuteKernel(
             // 写入映射表
             out_token_idx[write_pos] = idx;
             out_weights[write_pos] = w;
+
+            token2permuted_idx[idx * 8 + expert_cnt] = write_pos;
+            expert_cnt++;
         }
     }
+    token_counts[idx] = expert_cnt;
 }
 
 __global__ void countScanPermuteKernel(
@@ -1104,6 +1111,8 @@ __global__ void countScanPermuteKernel(
     int* __restrict__ total_tokens,           // [1]
     int* __restrict__ out_token_idx,          // [total_tokens]
     float* __restrict__ out_weights,          // [total_tokens]
+    int* __restrict__ token2permuted_idx,     // [seq_len * 8]
+    int* __restrict__ token_counts,
     int seq_len,
     int local_expert_offset
 ) {
@@ -1145,6 +1154,7 @@ __global__ void countScanPermuteKernel(
 
     // Pass-2: permute into compact buffers.
     for (int idx = tid; idx < seq_len; idx += blockDim.x) {
+        int expert_cnt = 0;
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
             const int e_id = routing_idx[idx * 8 + k];
@@ -1153,8 +1163,11 @@ __global__ void countScanPermuteKernel(
                 const int write_pos = atomicAdd(&smem_cursors[rel_id], 1);
                 out_token_idx[write_pos] = idx;
                 out_weights[write_pos] = routing_weight[idx * 8 + k];
+                token2permuted_idx[idx * 8 + expert_cnt] = write_pos;
+                expert_cnt++;
             }
         }
+        token_counts[idx] = expert_cnt;
     }
 }
 
@@ -1221,6 +1234,8 @@ void launchPermuteKernel(
     void* expert_offsets,
     void* out_token_idx,
     void* out_weights,
+    void* token2permuted_idx,     // [seq_len * 8]
+    void* token_counts,
     int seq_len,
     int local_expert_offset
 ) {
@@ -1232,6 +1247,8 @@ void launchPermuteKernel(
         static_cast<int*>(expert_offsets),
         static_cast<int*>(out_token_idx),
         static_cast<float*>(out_weights),
+        static_cast<int*>(token2permuted_idx),
+        static_cast<int*>(token_counts),
         seq_len,
         local_expert_offset
     );
@@ -1245,6 +1262,8 @@ void launchCountScanPermuteKernel(
     void* total_tokens,
     void* out_token_idx,
     void* out_weights,
+    void* token2permuted_idx,     // [seq_len * 8]
+    void* token_counts,
     int seq_len,
     int local_expert_offset
 ) {
@@ -1257,6 +1276,8 @@ void launchCountScanPermuteKernel(
         static_cast<int*>(total_tokens),
         static_cast<int*>(out_token_idx),
         static_cast<float*>(out_weights),
+        static_cast<int*>(token2permuted_idx),
+        static_cast<int*>(token_counts),
         seq_len,
         local_expert_offset
     );
@@ -1402,6 +1423,66 @@ void launchActQuantKernel(
         seq_len
     );
 }
+
+__global__ void reduce_add_kernel(
+    const __nv_bfloat16* __restrict__ tmp_output, // [seq*8, 7168]
+    const int* __restrict__ token2permuted_idx,     // [seq_len * 8]
+    const int* __restrict__ token_counts,           // [seq_len]
+    __nv_bfloat16* __restrict__ output           // [seq, 7168]
+) {
+    int token_id = blockIdx.x;
+
+    // Explicit 128-bit vectorized path: 1 x uint4 = 8 x bf16 = 4 x bf16x2.
+    int col_bf16 = threadIdx.x * 8;
+    for (; col_bf16 < 7168; col_bf16 += blockDim.x * 8) {
+        __nv_bfloat162 val2[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            val2[j] = __halves2bfloat162(__float2bfloat16(0.0f), __float2bfloat16(0.0f));
+        }
+        for (int i = 0; i < token_counts[token_id]; ++i) {
+            int permuted_idx = token2permuted_idx[token_id * 8 + i];
+            uint4 tmp_pack = reinterpret_cast<const uint4*>(
+                &tmp_output[permuted_idx * 7168 + col_bf16]
+            )[0];
+            const __nv_bfloat162* tmp_vals2 = reinterpret_cast<const __nv_bfloat162*>(&tmp_pack);
+
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                val2[j] = __hadd2(val2[j], tmp_vals2[j]);
+            }
+        }
+
+        uint4 out_pack;
+        __nv_bfloat162* out_vals2 = reinterpret_cast<__nv_bfloat162*>(&out_pack);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            out_vals2[j] = val2[j];
+        }
+
+        reinterpret_cast<uint4*>(&output[token_id * 7168 + col_bf16])[0] = out_pack;
+    }
+}
+
+void launchReduceAddKernel(
+    void* tmp_output,
+    void* token2permuted_idx,
+    void* token_counts,
+    void* output,
+    int seq_len
+) {
+    size_t zero_size = seq_len * 7168 * sizeof(__nv_bfloat16);
+    cudaMemsetAsync(output, 0, zero_size);
+
+    constexpr int threads_per_block = 256;
+    const int num_blocks = seq_len;
+    reduce_add_kernel<<<num_blocks, threads_per_block>>>(
+        static_cast<const __nv_bfloat16*>(tmp_output),
+        static_cast<const int*>(token2permuted_idx),
+        static_cast<const int*>(token_counts),
+        static_cast<__nv_bfloat16*>(output)
+    );
+}
 """
 
 cpp_src = """
@@ -1439,6 +1520,8 @@ void launchPermuteKernel(
     void* expert_offsets,
     void* out_token_idx,
     void* out_weights,
+    void* token2permuted_idx,     // [seq_len * 8]
+    void* token_counts,
     int seq_len,
     int local_expert_offset
 );
@@ -1451,6 +1534,8 @@ void launchCountScanPermuteKernel(
     void* total_tokens,
     void* out_token_idx,
     void* out_weights,
+    void* token2permuted_idx,     // [seq_len * 8]
+    void* token_counts,
     int seq_len,
     int local_expert_offset
 );
@@ -1498,6 +1583,8 @@ void fusedRoutePermuteCopyIntoWrapper(
     torch::Tensor permute_weight,
     torch::Tensor permute_hidden_states,
     torch::Tensor permute_hidden_states_scale,
+    torch::Tensor token2permuted_idx,
+    torch::Tensor token_counts,
     int seq_len
 ) {
     CHECK_CUDA(routing_logits);
@@ -1575,6 +1662,8 @@ void fusedRoutePermuteCopyIntoWrapper(
             expert_counts.data_ptr<int>(),
             permute_token_idx.data_ptr<int>(),
             permute_weight.data_ptr<float>(),
+            token2permuted_idx.data_ptr<int>(),
+            token_counts.data_ptr<int>(),
             static_cast<int>(seq_len),
             static_cast<int>(local_expert_offset)
         );
@@ -1587,6 +1676,8 @@ void fusedRoutePermuteCopyIntoWrapper(
         total_tokens_device.data_ptr<int>(),
         permute_token_idx.data_ptr<int>(),
         permute_weight.data_ptr<float>(),
+        token2permuted_idx.data_ptr<int>(),
+        token_counts.data_ptr<int>(),
         static_cast<int>(seq_len),
         static_cast<int>(local_expert_offset)
     );
@@ -1653,6 +1744,30 @@ void actQuantWrapper(
         seq_len
     );
 }
+
+void launchReduceAddKernel(
+    void* tmp_output,
+    void* token2permuted_idx,
+    void* token_counts,
+    void* output,
+    int seq_len
+);
+
+void reduceAddWrapper(
+    torch::Tensor tmp_output,
+    torch::Tensor token2permuted_idx,
+    torch::Tensor token_counts,
+    torch::Tensor output,
+    int seq_len
+) {
+    launchReduceAddKernel(
+        tmp_output.data_ptr(),
+        token2permuted_idx.data_ptr<int>(),
+        token_counts.data_ptr<int>(),
+        output.data_ptr<at::BFloat16>(),
+        seq_len
+    );
+}
 """
 
 
@@ -1660,7 +1775,7 @@ my_lib = load_inline(
     name = "fused_gating",
     cuda_sources=kernel_src,
     cpp_sources=cpp_src,
-    functions=["fusedRoutePermuteCopyIntoWrapper", "scatterAddWrapper", "actQuantWrapper"],
+    functions=["fusedRoutePermuteCopyIntoWrapper", "scatterAddWrapper", "actQuantWrapper", "reduceAddWrapper"],
     verbose=True
 )
 
@@ -1893,13 +2008,15 @@ class FusedMoeWorkspace:
         self.permute_weight = torch.empty((total_tokens,), device=device, dtype=torch.float32)
         self.permute_hidden_states = torch.empty((total_tokens, 7168), device=device, dtype=torch.float8_e4m3fn)
         self.permute_hidden_states_scale = torch.empty((56, total_tokens), device=device, dtype=torch.float32)
+        self.token2permuted_idx = torch.empty((seq_len * 8,), device=device, dtype=torch.int32)
+        self.token_counts = torch.empty((seq_len,), device=device, dtype=torch.int32)
 
         # gemm / reduce outputs
         self.gemm1_output = torch.empty((total_tokens, 2048), device=device, dtype=torch.float16)
         self.gemm2_input = torch.empty((total_tokens, 2048), device=device, dtype=torch.float8_e4m3fn)
         self.gemm2_input_scale = torch.empty((2048 // 128, total_tokens), device=device, dtype=torch.float32)
-        self.gemm2_output = torch.empty((total_tokens, 7168), device=device, dtype=torch.float32)
-        self.output = torch.empty((seq_len, 7168), device=device, dtype=torch.float32)
+        self.gemm2_output = torch.empty((total_tokens, 7168), device=device, dtype=torch.bfloat16)
+        self.output = torch.empty((seq_len, 7168), device=device, dtype=torch.bfloat16)
 
         self.stream = torch.cuda.current_stream()
 
@@ -1950,6 +2067,8 @@ def fused_moe(
         ws.permute_weight,
         ws.permute_hidden_states,
         ws.permute_hidden_states_scale,
+        ws.token2permuted_idx,
+        ws.token_counts,
         seq_len
     )
 
@@ -2010,16 +2129,16 @@ def fused_moe(
         stream,
     )
 
-    my_lib.scatterAddWrapper(
+    my_lib.reduceAddWrapper(
         ws.gemm2_output,
-        ws.permute_token_idx,
+        ws.token2permuted_idx,
+        ws.token_counts,
         ws.output,
-        ws.expert_offsets,
-        seq_len
+        seq_len,
     )
 
     # print("*************** fused over *****************\n")
-    return ws.output[:seq_len].to(torch.bfloat16)
+    return ws.output[:seq_len]
 
 def compute_error_stats(
     output: torch.Tensor, reference: torch.Tensor, cfg
@@ -2080,7 +2199,7 @@ def read_workload(
     
     return seq_len, routing_logits, routing_bias, local_expert_offset
 
-# workload_idx = 8
+# workload_idx = 17
 # seq_len, routing_logits, routing_bias, local_expert_offset = read_workload(idx=workload_idx)
 
 # print("========== test ==========")
