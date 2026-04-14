@@ -20,6 +20,7 @@ class GemmConfig:
     block_size_n: int
     block_size_k: int
     num_stages: int
+    use_tma: bool
 
 
 def get_blk_size_m(args):
@@ -53,6 +54,7 @@ def gemm1_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     tile_idx = tl.program_id(0)
     last_gemm_end_tile_idx = 0
@@ -83,12 +85,13 @@ def gemm1_kernel(
             # c_scale_ptr = c_scale_base_ptr + tl.load(a_offset_ptr + i)
 
             # TMA
-            a_desc = tl.make_tensor_descriptor(
-                a_ptr,
-                shape=[gm, gk],
-                strides=[lda, 1],
-                block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
-            )
+            if USE_TMA:
+                a_desc = tl.make_tensor_descriptor(
+                    a_ptr,
+                    shape=[gm, gk],
+                    strides=[lda, 1],
+                    block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+                )
             b1_desc = tl.make_tensor_descriptor(
                 b_ptr,
                 shape=[gn, gk],
@@ -101,12 +104,13 @@ def gemm1_kernel(
             #     strides=[ldb, 1],
             #     block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
             # )
-            c_desc = tl.make_tensor_descriptor(
-                c_ptr,
-                shape=[gm, gn],
-                strides=[ldc, 1],
-                block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-            )
+            if USE_TMA:
+                c_desc = tl.make_tensor_descriptor(
+                    c_ptr,
+                    shape=[gm, gn],
+                    strides=[ldc, 1],
+                    block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+                )
 
             # 在当前 gemm 内拿多个 tile
             while (tile_idx >= last_gemm_end_tile_idx and tile_idx < last_gemm_end_tile_idx + num_tiles):
@@ -125,19 +129,20 @@ def gemm1_kernel(
                 acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 # acc2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 for kk in tl.range(0, tl.cdiv(k, BLOCK_SIZE_K), num_stages=6, warp_specialize=True):
-                    a = a_desc.load(
-                        [offs_am, kk * BLOCK_SIZE_K],
-                    )
+                    if USE_TMA:
+                        a = a_desc.load(
+                            [offs_am, kk * BLOCK_SIZE_K],
+                        )
+                    else:
+                        a_idx = a_ptr + offs_am * lda + kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_M)[:, None] * lda + tl.arange(0, BLOCK_SIZE_K)[None, :]
+                        a = tl.load(a_idx, mask=((offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None]) # [BLOCK_SIZE_M, BLOCK_SIZE_K]
                     b1 = b1_desc.load(
                         [offs_bn1, kk * BLOCK_SIZE_K],
                     )
                     # b2 = b2_desc.load(
                     #     [offs_bn2, kk * BLOCK_SIZE_K],
                     # )
-                    # a_idx = a_ptr + offs_am * lda + kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_M)[:, None] * lda + tl.arange(0, BLOCK_SIZE_K)[None, :]
-                    # b1_idx = b_ptr + offs_bn1 * ldb + kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_N)[:, None] * ldb + tl.arange(0, BLOCK_SIZE_K)[None, :]
-                    # b2_idx = b_ptr + offs_bn2 * ldb + kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_N)[:, None] * ldb + tl.arange(0, BLOCK_SIZE_K)[None, :]
-                    # a = tl.load(a_idx, mask=((offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None]) # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+                    
                     # b1 = tl.load(b1_idx) # [BLOCK_SIZE_N, BLOCK_SIZE_K]
                     # b2 = tl.load(b2_idx) # [BLOCK_SIZE_N, BLOCK_SIZE_K
                     
@@ -185,12 +190,14 @@ def gemm1_kernel(
                 # 写回
                 offs_cm = tile_m_idx * BLOCK_SIZE_M
                 offs_cn = tile_n_idx * BLOCK_SIZE_N
-                c_desc.store(
-                    [offs_cm, offs_cn],
-                    acc1.to(tl.float16),
-                )
-                # c_idx = c_ptr + offs_cm * ldc + offs_cn + tl.arange(0, BLOCK_SIZE_M)[:, None] * ldc + tl.arange(0, BLOCK_SIZE_N)[None, :]
-                # tl.store(c_idx, res_c.to(tl.bfloat16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
+                if USE_TMA:
+                    c_desc.store(
+                        [offs_cm, offs_cn],
+                        acc1.to(tl.float16),
+                    )
+                else:
+                    c_idx = c_ptr + offs_cm * ldc + offs_cn + tl.arange(0, BLOCK_SIZE_M)[:, None] * ldc + tl.arange(0, BLOCK_SIZE_N)[None, :]
+                    tl.store(c_idx, acc1.to(tl.bfloat16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
                 # c_scale_idx = c_scale_ptr + offs_cm + tile_n_idx * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                 # tl.store(c_scale_idx, tile_scale, mask=(offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)
 
@@ -294,15 +301,16 @@ class gemm1Kernel:
             'NUM_SM': 'constexpr',
             'BLOCK_SIZE_M': 'constexpr',
             'BLOCK_SIZE_N': 'constexpr',
-            'BLOCK_SIZE_K': 'constexpr'
+            'BLOCK_SIZE_K': 'constexpr',
+            'USE_TMA': 'constexpr',
         }
 
         # blk_sizes = [64, 128]
         # num_stages = [8, 6]
         self.configs = []
-        self.configs.append(GemmConfig(block_size_m=64, block_size_n=128, block_size_k=128, num_stages=8))
-        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4))
-        self.configs.append(GemmConfig(block_size_m=128, block_size_n=128, block_size_k=128, num_stages=6))
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=128, block_size_k=128, num_stages=8, use_tma=False))
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4, use_tma=False))
+        self.configs.append(GemmConfig(block_size_m=128, block_size_n=128, block_size_k=128, num_stages=6, use_tma=True))
         constexprs_list = []
         options_list = []
         for i in range(len(self.configs)):
@@ -310,7 +318,8 @@ class gemm1Kernel:
                 (8,): num_sm, 
                 (9,): self.configs[i].block_size_m, 
                 (10,): self.configs[i].block_size_n, 
-                (11,): self.configs[i].block_size_k
+                (11,): self.configs[i].block_size_k,
+                (12,): self.configs[i].use_tma
             })
             options_list.append({
                 "num_warps": 8,
@@ -394,6 +403,7 @@ class gemm1Kernel:
             config.block_size_m,
             config.block_size_n,
             config.block_size_k,
+            config.use_tma
         )
         return
 
@@ -425,6 +435,7 @@ def gemm2_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     tile_idx = tl.program_id(0)
     last_gemm_end_tile_idx = 0
@@ -460,24 +471,26 @@ def gemm2_kernel(
             p_source_idx_ptr = permute_token_idx_base_ptr + offset
 
             # TMA
-            a_desc = tl.make_tensor_descriptor(
-                a_ptr,
-                shape=[gm, gk],
-                strides=[lda, 1],
-                block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
-            )
+            if USE_TMA:
+                a_desc = tl.make_tensor_descriptor(
+                    a_ptr,
+                    shape=[gm, gk],
+                    strides=[lda, 1],
+                    block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+                )
             b1_desc = tl.make_tensor_descriptor(
                 b_ptr,
                 shape=[gn, gk],
                 strides=[ldb, 1],
                 block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
             )
-            c_desc = tl.make_tensor_descriptor(
-                c_ptr,
-                shape=[gm, gn],
-                strides=[ldc, 1],
-                block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-            )
+            if USE_TMA:
+                c_desc = tl.make_tensor_descriptor(
+                    c_ptr,
+                    shape=[gm, gn],
+                    strides=[ldc, 1],
+                    block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+                )
 
             # 在当前 gemm 内拿多个 tile
             while (tile_idx >= last_gemm_end_tile_idx and tile_idx < last_gemm_end_tile_idx + num_tiles):
@@ -493,13 +506,17 @@ def gemm2_kernel(
                 num_k_blocks = tl.cdiv(k, 128)
                 acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 for kk in tl.range(0, tl.cdiv(k, BLOCK_SIZE_K), num_stages=8, warp_specialize=True):
-                    a = a_desc.load(
-                        [offs_am, kk * BLOCK_SIZE_K],
-                    )
+                    if USE_TMA:
+                        a = a_desc.load(
+                            [offs_am, kk * BLOCK_SIZE_K],
+                        )
+                    else:
+                        a_idx = a_ptr + offs_am * lda + kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_M)[:, None] * lda + tl.arange(0, BLOCK_SIZE_K)[None, :]
+                        a = tl.load(a_idx, mask=((offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None]) # [BLOCK_SIZE_M, BLOCK_SIZE_K]
                     b1 = b1_desc.load(
                         [offs_bn1, kk * BLOCK_SIZE_K],
                     )
-                    
+
                     a_scale_idx = a_scale_ptr + offs_am + kk * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
                     a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
@@ -536,10 +553,14 @@ def gemm2_kernel(
                 # 写回连续缓冲区
                 offs_cm = tile_m_idx * BLOCK_SIZE_M
                 offs_cn = tile_n_idx * BLOCK_SIZE_N
-                c_desc.store(
-                    [offs_cm, offs_cn],
-                    acc1.to(tl.bfloat16),
-                )
+                if USE_TMA:
+                    c_desc.store(
+                        [offs_cm, offs_cn],
+                        acc1.to(tl.bfloat16),
+                    )
+                else:
+                    c_idx = c_ptr + offs_cm * ldc + offs_cn + tl.arange(0, BLOCK_SIZE_M)[:, None] * ldc + tl.arange(0, BLOCK_SIZE_N)[None, :]
+                    tl.store(c_idx, acc1.to(tl.bfloat16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
 
                 # 下一个 tile
                 tile_idx += NUM_SM
@@ -642,12 +663,13 @@ class gemm2Kernel:
             'NUM_SM': 'constexpr',
             'BLOCK_SIZE_M': 'constexpr',
             'BLOCK_SIZE_N': 'constexpr',
-            'BLOCK_SIZE_K': 'constexpr'
+            'BLOCK_SIZE_K': 'constexpr',
+            'USE_TMA': 'constexpr',
         }
 
         self.configs = []
-        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4))
-        self.configs.append(GemmConfig(block_size_m=128, block_size_n=128, block_size_k=128, num_stages=4))
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4, use_tma=False))
+        self.configs.append(GemmConfig(block_size_m=128, block_size_n=128, block_size_k=128, num_stages=4, use_tma=True))
         constexprs_list = []
         options_list = []
         for i in range(len(self.configs)):
@@ -655,7 +677,8 @@ class gemm2Kernel:
                 (9,): num_sm, 
                 (10,): self.configs[i].block_size_m, 
                 (11,): self.configs[i].block_size_n, 
-                (12,): self.configs[i].block_size_k
+                (12,): self.configs[i].block_size_k,
+                (13,): self.configs[i].use_tma
             })
             options_list.append({
                 "num_warps": 8,
@@ -740,6 +763,7 @@ class gemm2Kernel:
             config.block_size_m,
             config.block_size_n,
             config.block_size_k,
+            config.use_tma
         )
         return
 
@@ -1430,11 +1454,13 @@ __global__ void reduce_add_kernel(
     const int* __restrict__ token_counts,           // [seq_len]
     __nv_bfloat16* __restrict__ output           // [seq, 7168]
 ) {
-    int token_id = blockIdx.x;
+    uint32_t token_id = blockIdx.x >> 3; // blockIdx.x / 8
+    uint32_t inter_id = blockIdx.x & 7; // blockIdx.x % 8
 
     // Explicit 128-bit vectorized path: 1 x uint4 = 8 x bf16 = 4 x bf16x2.
-    int col_bf16 = threadIdx.x * 8;
-    for (; col_bf16 < 7168; col_bf16 += blockDim.x * 8) {
+    int col_bf16 = threadIdx.x * 8 + inter_id * 1024;
+    // 每个 thread 一次处理 8 个 bf16，8 * 256 = 1024 个 bf16
+    if (col_bf16 < 7168) {
         __nv_bfloat162 val2[4];
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -1475,7 +1501,9 @@ void launchReduceAddKernel(
     cudaMemsetAsync(output, 0, zero_size);
 
     constexpr int threads_per_block = 256;
-    const int num_blocks = seq_len;
+    // 让一个 block 处理一个 token 的 1024 个 bf16
+    // 一个 token 对应于 7 个 block
+    const int num_blocks = seq_len * 8;
     reduce_add_kernel<<<num_blocks, threads_per_block>>>(
         static_cast<const __nv_bfloat16*>(tmp_output),
         static_cast<const int*>(token2permuted_idx),
@@ -1776,7 +1804,9 @@ my_lib = load_inline(
     cuda_sources=kernel_src,
     cpp_sources=cpp_src,
     functions=["fusedRoutePermuteCopyIntoWrapper", "scatterAddWrapper", "actQuantWrapper", "reduceAddWrapper"],
-    verbose=True
+    verbose=True,
+    extra_cflags=['-O3', '-march=native'],
+    extra_cuda_cflags=['-O3', '--use_fast_math']
 )
 
 print("load succ")
