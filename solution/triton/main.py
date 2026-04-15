@@ -785,6 +785,7 @@ kernel_src = """
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
 #include <device_launch_parameters.h>
+#include <cstdint>
 
 struct FusedGatingData
 {
