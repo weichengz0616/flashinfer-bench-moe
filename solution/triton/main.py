@@ -197,7 +197,7 @@ def gemm1_kernel(
                     )
                 else:
                     c_idx = c_ptr + offs_cm * ldc + offs_cn + tl.arange(0, BLOCK_SIZE_M)[:, None] * ldc + tl.arange(0, BLOCK_SIZE_N)[None, :]
-                    tl.store(c_idx, acc1.to(tl.bfloat16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
+                    tl.store(c_idx, acc1.to(tl.float16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
                 # c_scale_idx = c_scale_ptr + offs_cm + tile_n_idx * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                 # tl.store(c_scale_idx, tile_scale, mask=(offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)
 
@@ -786,6 +786,9 @@ kernel_src = """
 #include <cuda_fp8.h>
 #include <device_launch_parameters.h>
 #include <cstdint>
+
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
 
 struct FusedGatingData
 {
@@ -1498,9 +1501,6 @@ void launchReduceAddKernel(
     void* output,
     int seq_len
 ) {
-    size_t zero_size = seq_len * 7168 * sizeof(__nv_bfloat16);
-    cudaMemsetAsync(output, 0, zero_size);
-
     constexpr int threads_per_block = 256;
     // 让一个 block 处理一个 token 的 1024 个 bf16
     // 一个 token 对应于 7 个 block
@@ -1511,6 +1511,363 @@ void launchReduceAddKernel(
         static_cast<const int*>(token_counts),
         static_cast<__nv_bfloat16*>(output)
     );
+}
+
+
+__global__ void cooperative_kernel(
+    FusedGatingData gating_data,
+    const __nv_fp8_e4m3* __restrict__ input,        // [S, 7168]
+    const float* __restrict__ input_scale,          // [56, S]
+    int* __restrict__ expert_cnts,                // [32]
+    int* __restrict__ expert_offsets,               // [33]
+    int* __restrict__ out_token_idx,                // [total_tokens]
+    float* __restrict__ out_weights,                // [total_tokens]
+    __nv_fp8_e4m3* __restrict__ output,             // [total_tokens, 7168]
+    float* __restrict__ output_scale,               // [56, total_tokens]
+    int* __restrict__ token2permuted_idx,     // [seq_len * 8]
+    int* __restrict__ token_counts,           // [seq_len] - 这个数组用来记录每个 token 属于多少个 expert，方便后续 permute+copy 时定位
+    int seq_len,
+    int local_expert_offset
+) {
+    constexpr int HIDDEN_DIM = 7168;
+    constexpr int NUM_HIDDEN_BLOCKS = 56;
+    constexpr int VEC_SIZE = 16; // 128 bit / 8 bit = 16 fp8 values per uint4
+
+    cg::grid_group grid = cg::this_grid();
+
+    const int tid = threadIdx.x;
+    const int lane_id = tid & 31;
+    const int warp_id = tid >> 5;
+
+    // Stage-1: fused gating for all tokens assigned to this block in grid-stride order.
+    for (int token_idx = blockIdx.x; token_idx < seq_len; token_idx += gridDim.x) {
+        __shared__ __nv_bfloat16 smem_bias[NUM_EXPERTS];
+        __shared__ float smem_logits_with_sigmoid_bias[NUM_EXPERTS];
+        __shared__ float smem_group_sums[NUM_EXPERT_GROUPS];
+
+        const int global_idx = token_idx * blockDim.x + tid;
+        smem_bias[tid] = ((__nv_bfloat16*)gating_data.routing_bias)[tid];
+        float logit = ((float*)gating_data.routing_logits)[global_idx];
+        logit = 1.0f / (1.0f + expf(-logit));
+        logit += __bfloat162float(smem_bias[tid]);
+        smem_logits_with_sigmoid_bias[tid] = logit;
+
+        float top2_m1 = logit;
+        float top2_m2 = -FLT_MAX;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            const float other_m1 = __shfl_xor_sync(0xffffffff, top2_m1, mask);
+            const float other_m2 = __shfl_xor_sync(0xffffffff, top2_m2, mask);
+
+            if (other_m1 > top2_m1) {
+                top2_m2 = max(top2_m1, other_m2);
+                top2_m1 = other_m1;
+            } else if (other_m1 > top2_m2) {
+                top2_m2 = other_m1;
+            }
+        }
+
+        if (lane_id == 0) {
+            smem_group_sums[warp_id] = top2_m1 + top2_m2;
+        }
+        __syncthreads();
+
+        int selected_groups_idx[NUM_SELECTED_GROUPS];
+        int selected_group_expert_idx[NUM_SELECTED_GROUPS];
+        float selected_group_expert_score[NUM_SELECTED_GROUPS];
+        int top_expert_idx[NUM_SELECTED_EXPERTS];
+        float top_expert_score[NUM_SELECTED_EXPERTS];
+
+        if (warp_id == 0) {
+            if (lane_id == 0) {
+                float selected_groups_sums[NUM_SELECTED_GROUPS];
+                #pragma unroll
+                for (int i = 0; i < NUM_SELECTED_GROUPS; ++i) {
+                    selected_groups_idx[i] = -1;
+                    selected_groups_sums[i] = -FLT_MAX;
+                }
+
+                #pragma unroll
+                for (int i = 0; i < NUM_EXPERT_GROUPS; ++i) {
+                    const int cur_idx = i;
+                    const float cur_sum = smem_group_sums[i];
+
+                    #pragma unroll
+                    for (int j = 0; j < NUM_SELECTED_GROUPS; ++j) {
+                        if (cur_sum > selected_groups_sums[j]) {
+                            for (int k = NUM_SELECTED_GROUPS - 1; k > j; --k) {
+                                selected_groups_idx[k] = selected_groups_idx[k - 1];
+                                selected_groups_sums[k] = selected_groups_sums[k - 1];
+                            }
+                            selected_groups_idx[j] = cur_idx;
+                            selected_groups_sums[j] = cur_sum;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (int i = 0; i < NUM_SELECTED_GROUPS; ++i) {
+                selected_groups_idx[i] = __shfl_sync(0xffffffff, selected_groups_idx[i], 0);
+            }
+
+            #pragma unroll
+            for (int i = 0; i < NUM_SELECTED_GROUPS; ++i) {
+                const int group_idx = selected_groups_idx[i];
+                selected_group_expert_idx[i] = group_idx * NUM_EXPERTS / NUM_EXPERT_GROUPS + lane_id;
+                selected_group_expert_score[i] = smem_logits_with_sigmoid_bias[selected_group_expert_idx[i]];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < NUM_SELECTED_GROUPS; ++i) {
+                for (int j = i + 1; j < NUM_SELECTED_GROUPS; ++j) {
+                    if (selected_group_expert_score[j] > selected_group_expert_score[i]) {
+                        const float tmp_score = selected_group_expert_score[i];
+                        selected_group_expert_score[i] = selected_group_expert_score[j];
+                        selected_group_expert_score[j] = tmp_score;
+
+                        const int tmp_idx = selected_group_expert_idx[i];
+                        selected_group_expert_idx[i] = selected_group_expert_idx[j];
+                        selected_group_expert_idx[j] = tmp_idx;
+                    }
+                }
+            }
+
+            float thread_scores[NUM_SELECTED_EXPERTS];
+            int thread_indices[NUM_SELECTED_EXPERTS];
+            #pragma unroll
+            for (int i = 0; i < NUM_SELECTED_GROUPS; ++i) {
+                thread_scores[i] = selected_group_expert_score[i];
+                thread_indices[i] = selected_group_expert_idx[i];
+            }
+            #pragma unroll
+            for (int i = NUM_SELECTED_GROUPS; i < NUM_SELECTED_EXPERTS; ++i) {
+                thread_scores[i] = -FLT_MAX;
+                thread_indices[i] = -1;
+            }
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float other_scores[NUM_SELECTED_EXPERTS];
+                int other_indices[NUM_SELECTED_EXPERTS];
+
+                #pragma unroll
+                for (int i = 0; i < NUM_SELECTED_EXPERTS; ++i) {
+                    other_scores[i] = __shfl_down_sync(0xffffffff, thread_scores[i], offset);
+                    other_indices[i] = __shfl_down_sync(0xffffffff, thread_indices[i], offset);
+                }
+
+                float merged_scores[NUM_SELECTED_EXPERTS];
+                int merged_indices[NUM_SELECTED_EXPERTS];
+                int p1 = 0;
+                int p2 = 0;
+                #pragma unroll
+                for (int i = 0; i < NUM_SELECTED_EXPERTS; ++i) {
+                    if (thread_scores[p1] >= other_scores[p2]) {
+                        merged_scores[i] = thread_scores[p1];
+                        merged_indices[i] = thread_indices[p1];
+                        ++p1;
+                    } else {
+                        merged_scores[i] = other_scores[p2];
+                        merged_indices[i] = other_indices[p2];
+                        ++p2;
+                    }
+                }
+
+                #pragma unroll
+                for (int i = 0; i < NUM_SELECTED_EXPERTS; ++i) {
+                    thread_scores[i] = merged_scores[i];
+                    thread_indices[i] = merged_indices[i];
+                }
+            }
+
+            #pragma unroll
+            for (int i = 0; i < NUM_SELECTED_EXPERTS; ++i) {
+                top_expert_score[i] = __shfl_sync(0xffffffff, thread_scores[i], 0);
+                top_expert_idx[i] = __shfl_sync(0xffffffff, thread_indices[i], 0);
+            }
+
+            if (lane_id < NUM_SELECTED_EXPERTS) {
+                const int selected_expert = top_expert_idx[lane_id];
+                const float selected_score = top_expert_score[lane_id] - __bfloat162float(smem_bias[selected_expert]);
+
+                float score_sum = selected_score;
+                score_sum += __shfl_xor_sync(0xff, score_sum, 1);
+                score_sum += __shfl_xor_sync(0xff, score_sum, 2);
+                score_sum += __shfl_xor_sync(0xff, score_sum, 4);
+
+                const float final_score = selected_score * gating_data.routing_scaling_factor / score_sum;
+                const int write_idx = token_idx * NUM_SELECTED_EXPERTS + lane_id;
+                ((int*)gating_data.routing_idx)[write_idx] = selected_expert;
+                ((float*)gating_data.routing_weights)[write_idx] = final_score;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    grid.sync();
+
+    // Stage-2: count + exclusive scan, done by block0 for seq_len <= 64.
+    // expert_offsets[i] = [0,,,i-1] 的和
+    if (blockIdx.x == 0) {
+        __shared__ int smem_cnts[32];
+        if (tid < 32) {
+            smem_cnts[tid] = 0;
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < seq_len * 8; idx += blockDim.x) {
+            // #pragma unroll
+            // for (int k = 0; k < NUM_SELECTED_EXPERTS; ++k) {
+            //     const int e_id = ((int*)gating_data.routing_idx)[idx * NUM_SELECTED_EXPERTS + k];
+            //     if (e_id >= local_expert_offset && e_id < local_expert_offset + 32) {
+            //         atomicAdd(&smem_cnts[e_id - local_expert_offset], 1);
+            //     }
+            // }
+            int token_id = idx >> 3; // idx / 8
+            int inter_id = idx & 7; // idx % 8
+            int e_id = ((int*)gating_data.routing_idx)[token_id * 8 + inter_id];
+            if (e_id >= local_expert_offset && e_id < local_expert_offset + 32) {
+                atomicAdd(&smem_cnts[e_id - local_expert_offset], 1);
+            }
+        }
+        __syncthreads();
+
+        // if (tid == 0) {
+        //     int prefix = 0;
+        //     #pragma unroll
+        //     for (int i = 0; i < 32; ++i) {
+        //         int tmp = prefix;
+        //         prefix += smem_cnts[i];
+        //         smem_cnts[i] = tmp; // reuse smem for scan result
+        //     }
+        //     expert_offsets[32] = prefix;
+        // }
+        // __syncthreads();
+        // if (tid < 32) {
+        //     expert_offsets[tid] = smem_cnts[tid];
+        //     expert_cnts[tid] = smem_cnts[tid];
+        // }
+        if (tid < 32) {
+            int val = smem_cnts[tid];
+            #pragma unroll
+            for (int offset = 1; offset < 32; offset <<= 1) {
+                int remote = __shfl_up_sync(0xFFFFFFFF, val, offset);
+                if (tid >= offset) {
+                    val += remote;
+                }
+            }
+
+            int exclusive_val = __shfl_up_sync(0xFFFFFFFF, val, 1);
+            if (tid == 0) exclusive_val = 0;
+
+            smem_cnts[tid] = exclusive_val;
+            expert_offsets[tid] = exclusive_val;
+            if (tid == 31) {
+                expert_offsets[32] = val; // total count
+            }
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < seq_len; idx += blockDim.x) {
+            int expert_cnt = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int e_id = ((int*)gating_data.routing_idx)[idx * 8 + k];
+                if (e_id >= local_expert_offset && e_id < local_expert_offset + 32) {
+                    const int rel_id = e_id - local_expert_offset;
+                    const int write_pos = atomicAdd(&smem_cnts[rel_id], 1);
+                    out_token_idx[write_pos] = idx;
+                    out_weights[write_pos] = ((float*)gating_data.routing_weights)[idx * 8 + k];
+                    token2permuted_idx[idx * 8 + expert_cnt] = write_pos;
+                    expert_cnt++;
+                }
+            }
+            token_counts[idx] = expert_cnt;
+        }
+    }
+
+
+    grid.sync();
+
+    // Stage-3: copy fp8 activations and scales using permuted order.
+    const int total_valid = expert_offsets[32];
+    for (int out_row_idx = blockIdx.x; out_row_idx < total_valid; out_row_idx += gridDim.x) {
+        const int src_row_idx = out_token_idx[out_row_idx];
+
+        const uint4* src_ptr4 = reinterpret_cast<const uint4*>(input + src_row_idx * HIDDEN_DIM);
+        uint4* dst_ptr4 = reinterpret_cast<uint4*>(output + out_row_idx * HIDDEN_DIM);
+
+        for (int v = tid; v < HIDDEN_DIM / VEC_SIZE; v += blockDim.x) {
+            dst_ptr4[v] = src_ptr4[v];
+        }
+
+        for (int hb = tid; hb < NUM_HIDDEN_BLOCKS; hb += blockDim.x) {
+            output_scale[hb * seq_len * NUM_SELECTED_EXPERTS + out_row_idx] =
+                input_scale[hb * seq_len + src_row_idx];
+        }
+    }
+}
+
+
+bool launchCooperativeKernel(
+    void* routing_logits,
+    void* routing_bias,
+    float routing_scaling_factor,
+    void* routing_idx,
+    void* routing_weights,
+    void* input,
+    void* input_scale,
+    void* expert_counts,
+    void* expert_offsets,
+    // void* total_tokens,
+    void* out_token_idx,
+    void* out_weights,
+    void* output,
+    void* output_scale,
+    void* token2permuted_idx,     // [seq_len * 8]
+    void* token_counts,
+    int seq_len,
+    int local_expert_offset
+) {
+    constexpr int threads_per_block = 256;
+    int num_blocks = 128;
+
+    FusedGatingData data;
+    data.routing_logits = routing_logits;
+    data.routing_bias = routing_bias;
+    data.routing_scaling_factor = routing_scaling_factor;
+    data.routing_idx = routing_idx;
+    data.routing_weights = routing_weights;
+
+    void* kernel_args[] = {
+        &data,
+        &input,
+        &input_scale,
+        &expert_counts,
+        &expert_offsets,
+        // &total_tokens,
+        &out_token_idx,
+        &out_weights,
+        &output,
+        &output_scale,
+        &token2permuted_idx,
+        &token_counts,
+        &seq_len,
+        &local_expert_offset
+    };
+
+    cudaError_t st = cudaLaunchCooperativeKernel(
+        (void*)cooperative_kernel,
+        num_blocks,
+        threads_per_block,
+        kernel_args,
+        0,
+        0
+    );
+    return st == cudaSuccess;
 }
 """
 
@@ -1596,6 +1953,27 @@ void launchActQuantKernel(
     int seq_len
 );
 
+bool launchCooperativeKernel(
+    void* routing_logits,
+    void* routing_bias,
+    float routing_scaling_factor,
+    void* routing_idx,
+    void* routing_weights,
+    void* input,
+    void* input_scale,
+    void* expert_counts,
+    void* expert_offsets,
+    // void* total_tokens,
+    void* out_token_idx,
+    void* out_weights,
+    void* output,
+    void* output_scale,
+    void* token2permuted_idx,
+    void* token_counts,
+    int seq_len,
+    int local_expert_offset
+);
+
 void fusedRoutePermuteCopyIntoWrapper(
     torch::Tensor routing_logits,
     torch::Tensor routing_bias,
@@ -1665,6 +2043,30 @@ void fusedRoutePermuteCopyIntoWrapper(
     TORCH_CHECK(hidden_states_scale.size(0) == 56, "hidden_states_scale first dim must be 56");
     TORCH_CHECK(hidden_states_scale.size(1) == hidden_states.size(0), "hidden_states_scale second dim must equal hidden_states seq_len");
     TORCH_CHECK(routing_logits.size(0) == hidden_states.size(0), "routing_logits and hidden_states seq_len must match");
+
+    if (seq_len < 128) {
+        launchCooperativeKernel(
+            routing_logits.data_ptr<float>(),
+            routing_bias.data_ptr<at::BFloat16>(),
+            routing_scaling_factor,
+            routing_idx.data_ptr<int>(),
+            routing_weights.data_ptr<float>(),
+            hidden_states.data_ptr(),
+            hidden_states_scale.data_ptr<float>(),
+            expert_counts.data_ptr<int>(),
+            expert_offsets.data_ptr<int>(),
+            // total_tokens.data_ptr<int>(),
+            permute_token_idx.data_ptr<int>(),
+            permute_weight.data_ptr<float>(),
+            permute_hidden_states.data_ptr(),
+            permute_hidden_states_scale.data_ptr<float>(),
+            token2permuted_idx.data_ptr<int>(),
+            token_counts.data_ptr<int>(),
+            seq_len,
+            static_cast<int>(local_expert_offset)
+        );
+        return;
+    }
 
 
     launchFusedGatingKernel(
