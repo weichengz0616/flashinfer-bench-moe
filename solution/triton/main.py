@@ -21,6 +21,7 @@ class GemmConfig:
     block_size_k: int
     num_stages: int
     use_tma: bool
+    swap_ab: bool = False
 
 
 def get_blk_size_m(args):
@@ -55,6 +56,7 @@ def gemm1_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     USE_TMA: tl.constexpr,
+    SWAP_AB: tl.constexpr,
 ):
     tile_idx = tl.program_id(0)
     last_gemm_end_tile_idx = 0
@@ -126,7 +128,10 @@ def gemm1_kernel(
                 # 缩放矩阵每一行的元素个数
                 num_k_blocks = tl.cdiv(k, 128)
 
-                acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+                if SWAP_AB:
+                    acc1 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+                else:
+                    acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 # acc2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 for kk in tl.range(0, tl.cdiv(k, BLOCK_SIZE_K), num_stages=6, warp_specialize=True):
                     if USE_TMA:
@@ -149,20 +154,30 @@ def gemm1_kernel(
                     # 获取当前 128x128 block 的缩放因子
                     a_scale_idx = a_scale_ptr + offs_am + kk * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
-                    a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
+                    if SWAP_AB:
+                        a_scale_col = tl.reshape(a_scale_vec, (1, BLOCK_SIZE_M))
+                    else:
+                        a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
                     # b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
                     # acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
                     if BLOCK_SIZE_N == 128:
                         b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
-                        acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
+                        if SWAP_AB:
+                            acc1 += tl.dot(b1, a.T) * a_scale_col * b1_scale
+                        else:
+                            acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
                     else:
                         b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
                         b1_scale2 = tl.load(b_scale_ptr + ((offs_bn1 + 128) // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
                         scales = tl.join(b1_scale, b1_scale2)
                         b_scale_vec = tl.reshape(scales, (2, 1))
                         scales_expanded = tl.broadcast_to(b_scale_vec, (2, 128))
-                        final_scales = tl.reshape(scales_expanded, (1, 256))
-                        acc1 += tl.dot(a, b1.T) * a_scale_col * final_scales
+                        if SWAP_AB:
+                            final_scales = tl.reshape(scales_expanded, (256, 1))
+                            acc1 += tl.dot(b1, a.T) * a_scale_col * final_scales
+                        else:
+                            final_scales = tl.reshape(scales_expanded, (1, 256))
+                            acc1 += tl.dot(a, b1.T) * a_scale_col * final_scales
                     # acc2 += tl.dot(a, b2.T) * a_scale_col * b2_scale
                     # a = a.to(tl.float32) * a_scale_col
                     # b1 = b1.to(tl.float32) * b1_scale
@@ -193,11 +208,11 @@ def gemm1_kernel(
                 if USE_TMA:
                     c_desc.store(
                         [offs_cm, offs_cn],
-                        acc1.to(tl.float16),
+                        acc1.to(tl.float16).T if SWAP_AB else acc1.to(tl.float16),
                     )
                 else:
                     c_idx = c_ptr + offs_cm * ldc + offs_cn + tl.arange(0, BLOCK_SIZE_M)[:, None] * ldc + tl.arange(0, BLOCK_SIZE_N)[None, :]
-                    tl.store(c_idx, acc1.to(tl.float16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
+                    tl.store(c_idx, acc1.to(tl.float16).T if SWAP_AB else acc1.to(tl.float16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
                 # c_scale_idx = c_scale_ptr + offs_cm + tile_n_idx * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                 # tl.store(c_scale_idx, tile_scale, mask=(offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)
 
@@ -303,14 +318,15 @@ class gemm1Kernel:
             'BLOCK_SIZE_N': 'constexpr',
             'BLOCK_SIZE_K': 'constexpr',
             'USE_TMA': 'constexpr',
+            'SWAP_AB': 'constexpr',
         }
 
         # blk_sizes = [64, 128]
         # num_stages = [8, 6]
         self.configs = []
-        self.configs.append(GemmConfig(block_size_m=64, block_size_n=128, block_size_k=128, num_stages=8, use_tma=False))
-        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4, use_tma=False))
-        self.configs.append(GemmConfig(block_size_m=128, block_size_n=128, block_size_k=128, num_stages=6, use_tma=True))
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=128, block_size_k=128, num_stages=8, use_tma=False, swap_ab=False))
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4, use_tma=False, swap_ab=False))
+        self.configs.append(GemmConfig(block_size_m=128, block_size_n=256, block_size_k=128, num_stages=3, use_tma=True, swap_ab=False))
         constexprs_list = []
         options_list = []
         for i in range(len(self.configs)):
@@ -319,7 +335,8 @@ class gemm1Kernel:
                 (9,): self.configs[i].block_size_m, 
                 (10,): self.configs[i].block_size_n, 
                 (11,): self.configs[i].block_size_k,
-                (12,): self.configs[i].use_tma
+                (12,): self.configs[i].use_tma,
+                (13,): self.configs[i].swap_ab
             })
             options_list.append({
                 "num_warps": 8,
@@ -403,7 +420,8 @@ class gemm1Kernel:
             config.block_size_m,
             config.block_size_n,
             config.block_size_k,
-            config.use_tma
+            config.use_tma,
+            config.swap_ab
         )
         return
 
@@ -436,6 +454,7 @@ def gemm2_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     USE_TMA: tl.constexpr,
+    SWAP_AB: tl.constexpr,
 ):
     tile_idx = tl.program_id(0)
     last_gemm_end_tile_idx = 0
@@ -504,7 +523,10 @@ def gemm2_kernel(
 
                 # 缩放矩阵每一行的元素个数
                 num_k_blocks = tl.cdiv(k, 128)
-                acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+                if SWAP_AB:
+                    acc1 = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+                else:
+                    acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 for kk in tl.range(0, tl.cdiv(k, BLOCK_SIZE_K), num_stages=8, warp_specialize=True):
                     if USE_TMA:
                         a = a_desc.load(
@@ -519,24 +541,38 @@ def gemm2_kernel(
 
                     a_scale_idx = a_scale_ptr + offs_am + kk * seq_len * 8 + tl.arange(0, BLOCK_SIZE_M)
                     a_scale_vec = tl.load(a_scale_idx, mask=(offs_am + tl.arange(0, BLOCK_SIZE_M)) < gm, other=1.0)
-                    a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1)) # 广播到 [M, 1]
+                    if SWAP_AB:
+                        a_scale_col = tl.reshape(a_scale_vec, (1, BLOCK_SIZE_M))
+                    else:
+                        a_scale_col = tl.reshape(a_scale_vec, (BLOCK_SIZE_M, 1))
                     if BLOCK_SIZE_N == 128:
                         b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128)) # 1 个数
-                        acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
+                        if SWAP_AB:
+                            acc1 += tl.dot(b1, a.T) * a_scale_col * b1_scale
+                        else:
+                            acc1 += tl.dot(a, b1.T) * a_scale_col * b1_scale
                     else:
                         b1_scale = tl.load(b_scale_ptr + (offs_bn1 // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
                         b1_scale2 = tl.load(b_scale_ptr + ((offs_bn1 + 128) // 128) * num_k_blocks + (kk * BLOCK_SIZE_K // 128))
                         scales = tl.join(b1_scale, b1_scale2)
                         b_scale_vec = tl.reshape(scales, (2, 1))
                         scales_expanded = tl.broadcast_to(b_scale_vec, (2, 128))
-                        final_scales = tl.reshape(scales_expanded, (1, 256))
-                        acc1 += tl.dot(a, b1.T) * a_scale_col * final_scales
+                        if SWAP_AB:
+                            final_scales = tl.reshape(scales_expanded, (256, 1))
+                            acc1 += tl.dot(b1, a.T) * a_scale_col * final_scales
+                        else:
+                            final_scales = tl.reshape(scales_expanded, (1, 256))
+                            acc1 += tl.dot(a, b1.T) * a_scale_col * final_scales
+                        
 
                 # 和 weight 相乘
                 offs_m = offs_am + tl.arange(0, BLOCK_SIZE_M)
                 mask_m = offs_m < gm
                 tile_weights = tl.load(p_weight_ptr + offs_m, mask=mask_m, other=0.0)
-                acc1 = acc1 * tl.reshape(tile_weights, (BLOCK_SIZE_M, 1))
+                if SWAP_AB:
+                    acc1 = acc1 * tl.reshape(tile_weights, (1, BLOCK_SIZE_M))
+                else:
+                    acc1 = acc1 * tl.reshape(tile_weights, (BLOCK_SIZE_M, 1))
 
                 # 写回 output: scatter-add
                 # source_indices = tl.load(p_source_idx_ptr + offs_m, mask=mask_m, other=0)
@@ -556,11 +592,11 @@ def gemm2_kernel(
                 if USE_TMA:
                     c_desc.store(
                         [offs_cm, offs_cn],
-                        acc1.to(tl.bfloat16),
+                        acc1.to(tl.bfloat16).T if SWAP_AB else acc1.to(tl.bfloat16),
                     )
                 else:
                     c_idx = c_ptr + offs_cm * ldc + offs_cn + tl.arange(0, BLOCK_SIZE_M)[:, None] * ldc + tl.arange(0, BLOCK_SIZE_N)[None, :]
-                    tl.store(c_idx, acc1.to(tl.bfloat16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
+                    tl.store(c_idx, acc1.to(tl.bfloat16).T if SWAP_AB else acc1.to(tl.bfloat16), mask=((offs_cm + tl.arange(0, BLOCK_SIZE_M)) < gm)[:, None])
 
                 # 下一个 tile
                 tile_idx += NUM_SM
@@ -665,11 +701,13 @@ class gemm2Kernel:
             'BLOCK_SIZE_N': 'constexpr',
             'BLOCK_SIZE_K': 'constexpr',
             'USE_TMA': 'constexpr',
+            'SWAP_AB': 'constexpr',
         }
 
         self.configs = []
-        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4, use_tma=False))
-        self.configs.append(GemmConfig(block_size_m=128, block_size_n=128, block_size_k=128, num_stages=4, use_tma=True))
+        self.configs.append(GemmConfig(block_size_m=16, block_size_n=256, block_size_k=128, num_stages=4, use_tma=False, swap_ab=True))
+        self.configs.append(GemmConfig(block_size_m=64, block_size_n=256, block_size_k=128, num_stages=4, use_tma=False, swap_ab=False))
+        self.configs.append(GemmConfig(block_size_m=128, block_size_n=256, block_size_k=128, num_stages=3, use_tma=True, swap_ab=False))
         constexprs_list = []
         options_list = []
         for i in range(len(self.configs)):
@@ -678,7 +716,8 @@ class gemm2Kernel:
                 (10,): self.configs[i].block_size_m, 
                 (11,): self.configs[i].block_size_n, 
                 (12,): self.configs[i].block_size_k,
-                (13,): self.configs[i].use_tma
+                (13,): self.configs[i].use_tma,
+                (14,): self.configs[i].swap_ab,
             })
             options_list.append({
                 "num_warps": 8,
@@ -732,12 +771,15 @@ class gemm2Kernel:
 
         kernel = None
         config = None
-        if seq_len <= 1000:
+        if seq_len <= 128:
             kernel = self.kernels[0]
             config = self.configs[0]
-        else:
+        elif seq_len <= 1024:
             kernel = self.kernels[1]
             config = self.configs[1]
+        else:
+            kernel = self.kernels[2]
+            config = self.configs[2]
 
         grid = (self.num_sm, 1, 1)
         launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, permute_weights, permute_token_idx, seq_len, output)
@@ -763,7 +805,8 @@ class gemm2Kernel:
             config.block_size_m,
             config.block_size_n,
             config.block_size_k,
-            config.use_tma
+            config.use_tma,
+            config.swap_ab,
         )
         return
 
