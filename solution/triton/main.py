@@ -49,7 +49,6 @@ def gemm1_kernel(
     seq_len,
     # output
     c_base_ptr, # [sum(s_i), 4096], fp32
-    c_scale_base_ptr, # [2048//128, sum(s_i)], fp32
     # other
     NUM_SM: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -312,7 +311,6 @@ class gemm1Kernel:
             'b_scale_base_ptr': '*fp32',
             'seq_len': 'i32',
             'c_base_ptr': '*fp16',
-            'c_scale_base_ptr': '*fp32',
             'NUM_SM': 'constexpr',
             'BLOCK_SIZE_M': 'constexpr',
             'BLOCK_SIZE_N': 'constexpr',
@@ -331,12 +329,12 @@ class gemm1Kernel:
         options_list = []
         for i in range(len(self.configs)):
             constexprs_list.append({
-                (8,): num_sm, 
-                (9,): self.configs[i].block_size_m, 
-                (10,): self.configs[i].block_size_n, 
-                (11,): self.configs[i].block_size_k,
-                (12,): self.configs[i].use_tma,
-                (13,): self.configs[i].swap_ab
+                (7,): num_sm, 
+                (8,): self.configs[i].block_size_m, 
+                (9,): self.configs[i].block_size_n, 
+                (10,): self.configs[i].block_size_k,
+                (11,): self.configs[i].use_tma,
+                (12,): self.configs[i].swap_ab
             })
             options_list.append({
                 "num_warps": 8,
@@ -351,7 +349,6 @@ class gemm1Kernel:
             (4,): [['tt.divisibility', 16]],
             (5,): [['tt.divisibility', 16]],
             (6,): [['tt.divisibility', 16]],
-            (7,): [['tt.divisibility', 16]]
         }
 
         self.num_sm = num_sm
@@ -376,7 +373,6 @@ class gemm1Kernel:
             b_scale_base,
             seq_len,
             c_base,
-            c_scale_base, 
             stream=None):
         if stream is None:
             device = triton.runtime.driver.active.get_current_device()
@@ -398,7 +394,7 @@ class gemm1Kernel:
             config = self.configs[2]
 
         grid = (self.num_sm, 1, 1)
-        launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, seq_len, c_base, c_scale_base)
+        launch_metadata = kernel.launch_metadata(grid, stream, a_base, a_scale_base, a_offset, b_base, b_scale_base, seq_len, c_base)
 
         kernel.run(
             grid[0], grid[1], grid[2],
@@ -415,7 +411,6 @@ class gemm1Kernel:
             b_scale_base,
             seq_len,
             c_base,
-            c_scale_base,
             self.num_sm,
             config.block_size_m,
             config.block_size_n,
@@ -2723,7 +2718,7 @@ def fused_moe(
         gemm1_weights_scale,
         seq_len,
         ws.gemm1_output,
-        ws.gemm2_input_scale,
+        # ws.gemm2_input_scale,
         stream,
     )
     my_lib.actQuantWrapper(
