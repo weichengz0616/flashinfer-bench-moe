@@ -1425,7 +1425,77 @@ void launchScatterAddKernel(
     );
 }
 
-__global__ void act_quant_kernel(
+__global__ void act_quant_kernel_small(
+    const __half* __restrict__ input, // [valid, 4096], fp16
+    __nv_fp8_e4m3* __restrict__ output,      // [valid, 2048]
+    float* __restrict__ scale,       // [2048 / 128, valid]
+    int* __restrict__ offset,        // [33]
+    int seq_len
+) {
+    constexpr int HIDDEN = 2048;
+    constexpr int GROUP = 128;
+    constexpr float FP8_E4M3_MAX = 448.0f;
+
+    const int row = blockIdx.x >> 2; // blockIdx.x / 4, 每 4 个 block 处理一个 token
+    const int group_idx_start = (blockIdx.x & 3) * 4; // (blockIdx.x % 4) * 4, 每个 token 的 16 个 group 分成 4 份，每份 4 个 group
+
+    const int num_valid = offset[32];
+    if (row >= num_valid) {
+        return;
+    }
+
+    int lane_id = threadIdx.x & 31;
+    int warp_id = __shfl_sync(0xffffffff, threadIdx.x >> 5, 0);
+
+    
+    int group_idx = group_idx_start + warp_id; // 每个 warp 处理一个 group
+    int warp_offset1 = row * (HIDDEN * 2) + group_idx * GROUP;
+    int warp_offset2 = row * (HIDDEN * 2) + group_idx * GROUP + HIDDEN;
+
+    // 每个线程处理自己的 4*2 个 half 值
+    const int2* ptr1 = reinterpret_cast<const int2*>(input + warp_offset1);
+    const int2* ptr2 = reinterpret_cast<const int2*>(input + warp_offset2);
+    int2 val1 = ptr1[lane_id];
+    int2 val2 = ptr2[lane_id];
+    half* h1 = reinterpret_cast<half*>(&val1);
+    half* h2 = reinterpret_cast<half*>(&val2);
+
+    float res[4];
+    float abs_res[4];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        float x1 = __half2float(h1[k]);
+        float x2 = __half2float(h2[k]);
+        float silu2 = x2 / (1.0f + expf(-x2));
+        res[k] = x1 * silu2;
+        abs_res[k] = fabsf(res[k]);
+    }
+
+    // warp 内求 abs 的 max
+    float local_max = fmaxf(fmaxf(abs_res[0], abs_res[1]), fmaxf(abs_res[2], abs_res[3]));
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, local_max, offset);
+        local_max = fmaxf(local_max, other);
+    }
+    local_max = __shfl_sync(0xffffffff, local_max, 0);
+
+    // group scale
+    float group_scale = (local_max > 0.0f) ? (local_max / FP8_E4M3_MAX) : 1.0f;
+    if (lane_id == 0) {
+        scale[group_idx * seq_len * 8 + row] = group_scale;
+    }
+
+    // quantize and write back
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        float q = res[k] / group_scale;
+        q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+        reinterpret_cast<__nv_fp8_e4m3*>(output + row * HIDDEN + group_idx * GROUP)[lane_id * 4 + k] = static_cast<__nv_fp8_e4m3>(q);
+    }
+}
+
+__global__ void act_quant_kernel_large(
     const __half* __restrict__ input, // [valid, 4096], fp16
     __nv_fp8_e4m3* __restrict__ output,      // [valid, 2048]
     float* __restrict__ scale,       // [2048 / 128, valid]
@@ -1437,44 +1507,66 @@ __global__ void act_quant_kernel(
     constexpr float FP8_E4M3_MAX = 448.0f;
 
     const int row = blockIdx.x;
-    const int group_idx = blockIdx.y;
-    const int tid = threadIdx.x;
-
     const int num_valid = offset[32];
-    if (row >= num_valid || group_idx >= (HIDDEN / GROUP) || tid >= GROUP) {
+    if (row >= num_valid) {
         return;
     }
 
-    const int col = group_idx * GROUP + tid;
-    const int in_row_base = row * (HIDDEN * 2);
-    const int out_row_base = row * HIDDEN;
+    int lane_id = threadIdx.x & 31;
+    int warp_id = __shfl_sync(0xffffffff, threadIdx.x >> 5, 0);
+    int num_warps = blockDim.x >> 5; // blockDim.x / 32
 
-    // input 被拆成前后两半：input1 和 input2，然后做 input1 * SiLU(input2)。
-    const float x1 = __half2float(input[in_row_base + col]);
-    const float x2 = __half2float(input[in_row_base + HIDDEN + col]);
-    const float silu2 = x2 / (1.0f + expf(-x2));
-    const float res = x1 * silu2;
+    // 一共 2048/128 = 16 个 group，一个 warp 处理一个 group
+    #pragma unroll
+    for (int i = warp_id; i < 16; i += num_warps) {
+        // 下面 warp 内处理各自的 group
+        int group_idx = i;
 
-    __shared__ float smem_abs_max[GROUP];
-    smem_abs_max[tid] = fabsf(res);
-    __syncthreads();
+        int warp_offset1 = row * (HIDDEN * 2) + i * GROUP;
+        int warp_offset2 = row * (HIDDEN * 2) + i * GROUP + HIDDEN;
 
-    for (int stride = GROUP / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            smem_abs_max[tid] = fmaxf(smem_abs_max[tid], smem_abs_max[tid + stride]);
+        // 每个线程处理自己的 4*2 个 half 值
+        const int2* ptr1 = reinterpret_cast<const int2*>(input + warp_offset1);
+        const int2* ptr2 = reinterpret_cast<const int2*>(input + warp_offset2);
+        int2 val1 = ptr1[lane_id];
+        int2 val2 = ptr2[lane_id];
+        half* h1 = reinterpret_cast<half*>(&val1);
+        half* h2 = reinterpret_cast<half*>(&val2);
+
+        float res[4];
+        float abs_res[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float x1 = __half2float(h1[k]);
+            float x2 = __half2float(h2[k]);
+            float silu2 = x2 / (1.0f + expf(-x2));
+            res[k] = x1 * silu2;
+            abs_res[k] = fabsf(res[k]);
         }
-        __syncthreads();
-    }
 
-    const float max_abs = smem_abs_max[0];
-    const float group_scale = (max_abs > 0.0f) ? (max_abs / FP8_E4M3_MAX) : 1.0f;
-    if (tid == 0) {
-        scale[group_idx * seq_len * 8 + row] = group_scale;
-    }
+        // warp 内求 abs 的 max
+        float local_max = fmaxf(fmaxf(abs_res[0], abs_res[1]), fmaxf(abs_res[2], abs_res[3]));
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            float other = __shfl_down_sync(0xffffffff, local_max, offset);
+            local_max = fmaxf(local_max, other);
+        }
+        local_max = __shfl_sync(0xffffffff, local_max, 0);
 
-    float q = res / group_scale;
-    q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
-    output[out_row_base + col] = static_cast<__nv_fp8_e4m3>(q);
+        // group scale
+        float group_scale = (local_max > 0.0f) ? (local_max / FP8_E4M3_MAX) : 1.0f;
+        if (lane_id == 0) {
+            scale[group_idx * seq_len * 8 + row] = group_scale;
+        }
+
+        // quantize and write back
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            float q = res[k] / group_scale;
+            q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+            reinterpret_cast<__nv_fp8_e4m3*>(output + row * HIDDEN + i * GROUP)[lane_id * 4 + k] = static_cast<__nv_fp8_e4m3>(q);
+        }
+    }
 }
 
 void launchActQuantKernel(
@@ -1485,17 +1577,69 @@ void launchActQuantKernel(
     int seq_len
 ) {
     constexpr int threads_per_block = 128;
-    const dim3 grid_dim(seq_len * 8, 2048 / 128);
-    act_quant_kernel<<<grid_dim, threads_per_block>>>(
-        static_cast<const __half*>(input),
-        static_cast<__nv_fp8_e4m3*>(output),
-        static_cast<float*>(scale),
-        static_cast<int*>(offset),
-        seq_len
-    );
+    if (seq_len <=128) {
+        const dim3 grid_dim(seq_len * 8 * 4);
+        act_quant_kernel_small<<<grid_dim, threads_per_block>>>(
+            static_cast<const __half*>(input),
+            static_cast<__nv_fp8_e4m3*>(output),
+            static_cast<float*>(scale),
+            static_cast<int*>(offset),
+            seq_len
+        );
+    } else {
+        const dim3 grid_dim(seq_len * 8);
+        act_quant_kernel_large<<<grid_dim, threads_per_block>>>(
+            static_cast<const __half*>(input),
+            static_cast<__nv_fp8_e4m3*>(output),
+            static_cast<float*>(scale),
+            static_cast<int*>(offset),
+            seq_len
+        );
+    }
+    
 }
 
-__global__ void reduce_add_kernel(
+__global__ void reduce_add_kernel_large(
+    const __nv_bfloat16* __restrict__ tmp_output, // [seq*8, 7168]
+    const int* __restrict__ token2permuted_idx,     // [seq_len * 8]
+    const int* __restrict__ token_counts,           // [seq_len] - 这个数组用来记录每个 token 属于多少个 expert，方便后续 permute+copy 时定位
+    __nv_bfloat16* __restrict__ output           // [seq, 7168]
+) {
+    int token_id = blockIdx.x;
+
+    // Explicit 128-bit vectorized path: 1 x uint4 = 8 x bf16 = 4 x bf16x2.
+    int col_bf16 = threadIdx.x * 8;
+    for (; col_bf16 < 7168; col_bf16 += blockDim.x * 8) {
+        __nv_bfloat162 val2[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            val2[j] = __halves2bfloat162(__float2bfloat16(0.0f), __float2bfloat16(0.0f));
+        }
+        for (int i = 0; i < token_counts[token_id]; ++i) {
+            int permuted_idx = token2permuted_idx[token_id * 8 + i];
+            uint4 tmp_pack = reinterpret_cast<const uint4*>(
+                &tmp_output[permuted_idx * 7168 + col_bf16]
+            )[0];
+            const __nv_bfloat162* tmp_vals2 = reinterpret_cast<const __nv_bfloat162*>(&tmp_pack);
+
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                val2[j] = __hadd2(val2[j], tmp_vals2[j]);
+            }
+        }
+
+        uint4 out_pack;
+        __nv_bfloat162* out_vals2 = reinterpret_cast<__nv_bfloat162*>(&out_pack);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            out_vals2[j] = val2[j];
+        }
+
+        reinterpret_cast<uint4*>(&output[token_id * 7168 + col_bf16])[0] = out_pack;
+    }
+}
+
+__global__ void reduce_add_kernel_small(
     const __nv_bfloat16* __restrict__ tmp_output, // [seq*8, 7168]
     const int* __restrict__ token2permuted_idx,     // [seq_len * 8]
     const int* __restrict__ token_counts,           // [seq_len]
@@ -1545,15 +1689,26 @@ void launchReduceAddKernel(
     int seq_len
 ) {
     constexpr int threads_per_block = 256;
-    // 让一个 block 处理一个 token 的 1024 个 bf16
-    // 一个 token 对应于 7 个 block
-    const int num_blocks = seq_len * 8;
-    reduce_add_kernel<<<num_blocks, threads_per_block>>>(
-        static_cast<const __nv_bfloat16*>(tmp_output),
-        static_cast<const int*>(token2permuted_idx),
-        static_cast<const int*>(token_counts),
-        static_cast<__nv_bfloat16*>(output)
-    );
+    if (seq_len <= 128) {
+        // 让一个 block 处理一个 token 的 1024 个 bf16
+        // 一个 token 对应于 7 个 block
+        const int num_blocks = seq_len * 8;
+        reduce_add_kernel_small<<<num_blocks, threads_per_block>>>(
+            static_cast<const __nv_bfloat16*>(tmp_output),
+            static_cast<const int*>(token2permuted_idx),
+            static_cast<const int*>(token_counts),
+            static_cast<__nv_bfloat16*>(output)
+        );
+    } else {
+        const int num_blocks = seq_len;
+        reduce_add_kernel_large<<<num_blocks, threads_per_block>>>(
+            static_cast<const __nv_bfloat16*>(tmp_output),
+            static_cast<const int*>(token2permuted_idx),
+            static_cast<const int*>(token_counts),
+            static_cast<__nv_bfloat16*>(output)
+        );
+    }
+    
 }
 
 
