@@ -1501,65 +1501,67 @@ __global__ void act_quant_kernel_large(
     constexpr int GROUP = 128;
     constexpr float FP8_E4M3_MAX = 448.0f;
 
-    const int row = blockIdx.x;
+    // const int row = blockIdx.x;
     const int num_valid = offset[32];
-    if (row >= num_valid) {
-        return;
-    }
+    //if (row >= num_valid) {
+    //    return;
+    //}
 
     int lane_id = threadIdx.x & 31;
     int warp_id = __shfl_sync(0xffffffff, threadIdx.x >> 5, 0);
     int num_warps = blockDim.x >> 5; // blockDim.x / 32
 
     // 一共 2048/128 = 16 个 group，一个 warp 处理一个 group
-    #pragma unroll
-    for (int i = warp_id; i < 16; i += num_warps) {
-        // 下面 warp 内处理各自的 group
-        int group_idx = i;
-
-        int warp_offset1 = row * (HIDDEN * 2) + i * GROUP;
-        int warp_offset2 = row * (HIDDEN * 2) + i * GROUP + HIDDEN;
-
-        // 每个线程处理自己的 4*2 个 half 值
-        const int2* ptr1 = reinterpret_cast<const int2*>(input + warp_offset1);
-        const int2* ptr2 = reinterpret_cast<const int2*>(input + warp_offset2);
-        int2 val1 = ptr1[lane_id];
-        int2 val2 = ptr2[lane_id];
-        half* h1 = reinterpret_cast<half*>(&val1);
-        half* h2 = reinterpret_cast<half*>(&val2);
-
-        float res[4];
-        float abs_res[4];
+    for (int row = blockIdx.x; row < num_valid; row += gridDim.x) {
         #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            float x1 = __half2float(h1[k]);
-            float x2 = __half2float(h2[k]);
-            float silu2 = x2 / (1.0f + expf(-x2));
-            res[k] = x1 * silu2;
-            abs_res[k] = fabsf(res[k]);
-        }
+        for (int i = warp_id; i < 16; i += num_warps) {
+            // 下面 warp 内处理各自的 group
+            int group_idx = i;
 
-        // warp 内求 abs 的 max
-        float local_max = fmaxf(fmaxf(abs_res[0], abs_res[1]), fmaxf(abs_res[2], abs_res[3]));
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            float other = __shfl_down_sync(0xffffffff, local_max, offset);
-            local_max = fmaxf(local_max, other);
-        }
-        local_max = __shfl_sync(0xffffffff, local_max, 0);
+            int warp_offset1 = row * (HIDDEN * 2) + i * GROUP;
+            int warp_offset2 = row * (HIDDEN * 2) + i * GROUP + HIDDEN;
 
-        // group scale
-        float group_scale = (local_max > 0.0f) ? (local_max / FP8_E4M3_MAX) : 1.0f;
-        if (lane_id == 0) {
-            scale[group_idx * seq_len * 8 + row] = group_scale;
-        }
+            // 每个线程处理自己的 4*2 个 half 值
+            const int2* ptr1 = reinterpret_cast<const int2*>(input + warp_offset1);
+            const int2* ptr2 = reinterpret_cast<const int2*>(input + warp_offset2);
+            int2 val1 = ptr1[lane_id];
+            int2 val2 = ptr2[lane_id];
+            half* h1 = reinterpret_cast<half*>(&val1);
+            half* h2 = reinterpret_cast<half*>(&val2);
 
-        // quantize and write back
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            float q = res[k] / group_scale;
-            q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
-            reinterpret_cast<__nv_fp8_e4m3*>(output + row * HIDDEN + i * GROUP)[lane_id * 4 + k] = static_cast<__nv_fp8_e4m3>(q);
+            float res[4];
+            float abs_res[4];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                float x1 = __half2float(h1[k]);
+                float x2 = __half2float(h2[k]);
+                float silu2 = x2 / (1.0f + expf(-x2));
+                res[k] = x1 * silu2;
+                abs_res[k] = fabsf(res[k]);
+            }
+
+            // warp 内求 abs 的 max
+            float local_max = fmaxf(fmaxf(abs_res[0], abs_res[1]), fmaxf(abs_res[2], abs_res[3]));
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                float other = __shfl_down_sync(0xffffffff, local_max, offset);
+                local_max = fmaxf(local_max, other);
+            }
+            local_max = __shfl_sync(0xffffffff, local_max, 0);
+
+            // group scale
+            float group_scale = (local_max > 0.0f) ? (local_max / FP8_E4M3_MAX) : 1.0f;
+            if (lane_id == 0) {
+                scale[group_idx * seq_len * 8 + row] = group_scale;
+            }
+
+            // quantize and write back
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                float q = res[k] / group_scale;
+                q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+                reinterpret_cast<__nv_fp8_e4m3*>(output + row * HIDDEN + i * GROUP)[lane_id * 4 + k] = static_cast<__nv_fp8_e4m3>(q);
+            }
         }
     }
 }
@@ -1572,7 +1574,7 @@ void launchActQuantKernel(
     int seq_len
 ) {
     constexpr int threads_per_block = 128;
-    if (seq_len <=128) {
+    if (seq_len <= 128) {
         const dim3 grid_dim(seq_len * 8 * 4);
         act_quant_kernel_small<<<grid_dim, threads_per_block>>>(
             static_cast<const __half*>(input),
@@ -1582,7 +1584,9 @@ void launchActQuantKernel(
             seq_len
         );
     } else {
-        const dim3 grid_dim(seq_len * 8);
+        int num_blocks = seq_len;
+        if (seq_len <= 2048) num_blocks = seq_len * 8;
+        const dim3 grid_dim(num_blocks);
         act_quant_kernel_large<<<grid_dim, threads_per_block>>>(
             static_cast<const __half*>(input),
             static_cast<__nv_fp8_e4m3*>(output),
