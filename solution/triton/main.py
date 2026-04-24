@@ -1251,20 +1251,22 @@ __global__ void moe_permute_copy_fp8_with_scale_kernel(
     const int NUM_HIDDEN_BLOCKS = 56;
     const int VEC_SIZE = 16; // 128 bit / 8 bit = 16 elements per uint4
 
-    int out_row_idx = blockIdx.x;
-    if (out_row_idx >= offset[32]) return;
+    // int out_row_idx = blockIdx.x;
+    // if (out_row_idx >= offset[32]) return;
+    int num_valid = offset[32];
+    for (int out_row_idx = blockIdx.x; out_row_idx < num_valid; out_row_idx += gridDim.x) {
+        int src_row_idx = permuted_token_idx[out_row_idx];
 
-    int src_row_idx = permuted_token_idx[out_row_idx];
+        const uint4* src_ptr4 = reinterpret_cast<const uint4*>(input + src_row_idx * HIDDEN_DIM);
+        uint4* dst_ptr4 = reinterpret_cast<uint4*>(output + out_row_idx * HIDDEN_DIM);
 
-    const uint4* src_ptr4 = reinterpret_cast<const uint4*>(input + src_row_idx * HIDDEN_DIM);
-    uint4* dst_ptr4 = reinterpret_cast<uint4*>(output + out_row_idx * HIDDEN_DIM);
+        for (int v = threadIdx.x; v < HIDDEN_DIM / VEC_SIZE; v += blockDim.x) {
+            dst_ptr4[v] = src_ptr4[v];
+        }
 
-    for (int v = threadIdx.x; v < HIDDEN_DIM / VEC_SIZE; v += blockDim.x) {
-        dst_ptr4[v] = src_ptr4[v];
-    }
-
-    for (int hb = threadIdx.x; hb < NUM_HIDDEN_BLOCKS; hb += blockDim.x) {
-        output_scale[hb * input_seq_len * 8 + out_row_idx] = input_scale[hb * input_seq_len + src_row_idx];
+        for (int hb = threadIdx.x; hb < NUM_HIDDEN_BLOCKS; hb += blockDim.x) {
+            output_scale[hb * input_seq_len * 8 + out_row_idx] = input_scale[hb * input_seq_len + src_row_idx];
+        }
     }
 }
 
@@ -1359,7 +1361,8 @@ void launchMoePermuteCopyFp8WithScaleKernel(
     int input_seq_len
 ) {
     constexpr int threads_per_block = 256;
-    const int num_blocks = input_seq_len * 8;
+    int num_blocks = input_seq_len;
+    if (input_seq_len <= 2048) num_blocks = input_seq_len * 8;
     moe_permute_copy_fp8_with_scale_kernel<<<num_blocks, threads_per_block>>>(
         static_cast<const __nv_fp8_e4m3*>(input),
         static_cast<const float*>(input_scale),
@@ -2869,7 +2872,7 @@ def read_workload(
 # # local_expert_offset = 32
 # routed_scaling_factor = 1.11
 
-
+# # from torch.profiler import profile, ProfilerActivity, record_function
 # # with profile(
 # #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
 # #     with_stack=True,
