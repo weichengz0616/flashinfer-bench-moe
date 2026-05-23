@@ -1,5 +1,35 @@
 # [FlashInfer AI Kernel Generation Contest @ MLSys 2026](http://mlsys26.flashinfer.ai/)
 
+## Update: the final evaluation results
+
+Average speedup vs. flashinfer_wrapper_9sdjf3 (flashinfer v0.6.9): **1.62x** (#5; #1 speedup is 1.71x).
+
+| [Workload](https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest/blob/main/workloads/moe/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.jsonl) uuid | Input length | Latency(ms) |
+| ------ | ------ | ------ |
+| e05c6c03 | 1 | 0.068 |
+| 2e69caee | 15 | 0.088 |
+| b8f4f012 | 7 | 0.105 |
+| 8cba5890 | 14 | 0.157 |
+| a7c2bcfd | 16 | 0.159 |
+| f7d6ac7c | 52 | 0.182 |
+| 5eadab1e | 62 | 0.188 |
+| eedc63b2 | 59 | 0.218 |
+| 6230e838 | 32 | 0.225 |
+| 76010cb4 | 54 | 0.233 |
+| 81955b1e | 55 | 0.234 |
+| fc378037 | 53 | 0.236 |
+| 74d7ff04 | 57 | 0.237 |
+| e626d3e6 | 58 | 0.242 |
+| 4822167c | 56 | 0.254 |
+| 8f1ff9f1 | 80 | 0.281 |
+| 1a4c6ba1 | 901 | 0.327 |
+| 58a34f27 | 11948 | 0.855 |
+| 5e8dc11c | 14107 | 1.200 |
+
+[MoE kernel entrypoint](https://github.com/weichengz0616/flashinfer-bench-moe/blob/main/solution/triton/main.py#L2669)
+
+---
+
 Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
 
 ---
